@@ -9,82 +9,71 @@
 // Trigram posting list intersection utilities
 // ---------------------------------------------------------------------------
 
+namespace {
+/// Narrow `trigrams` (which may contain duplicates) down to the posting lists
+/// they name, rarest first. The smallest list is the only one materialised; every
+/// remaining trigram is probed against that run, so a keyword made of common
+/// trigrams still costs one small vector instead of a copy of each list.
+/// `allFound` is cleared when any trigram is absent, which proves nothing matches.
+std::vector<uint32_t> intersectByTrigrams(const PostingIndex<Trigram>& index,
+                                          const std::vector<Trigram>& trigrams,
+                                          bool& allFound) {
+    std::vector<Trigram> unique = trigrams;
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    if (unique.empty()) { allFound = false; return {}; }
+
+    std::vector<std::pair<uint32_t, Trigram>> ranked;
+    ranked.reserve(unique.size());
+    for (Trigram t : unique) {
+        uint32_t n = index.count(t);
+        if (n == 0) { allFound = false; return {}; }
+        ranked.emplace_back(n, t);
+    }
+    std::sort(ranked.begin(), ranked.end());
+
+    std::vector<uint32_t> result;
+    index.decode(ranked[0].second, result);
+    for (size_t i = 1; i < ranked.size() && !result.empty(); i++) {
+        // A varint run has no random access: narrowing costs a full decode of
+        // that run (~2ns/posting measured), while the leftover candidates only
+        // cost one verification each (~20ns/record on the 5.1M-record index).
+        // Stop once narrowing is more than 16x past break-even; on a keyword of
+        // common trigrams the extra narrowing prunes almost nothing anyway.
+        // Because count(t) <= totalSize, skipping implies result.size() <
+        // totalSize/16, so a skipped narrowing can never push the query over the
+        // caller's `<= totalSize/10` candidate gate into a linear scan.
+        if (static_cast<uint64_t>(ranked[i].first) >
+            static_cast<uint64_t>(result.size()) * 16) break;
+        result = index.intersectWith(result, ranked[i].second);
+    }
+    return result;
+}
+}  // namespace
+
 std::vector<uint32_t> SearchEngine::intersectPostingLists(
-    const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+    const PostingIndex<Trigram>& index,
     const std::string& keyword,
     bool& allFound) {
     allFound = true;
-    auto keyTrigrams = ContentIndex::extractTrigrams(keyword);
-    std::unordered_set<Trigram> unique(keyTrigrams.begin(), keyTrigrams.end());
-    if (unique.empty()) { allFound = false; return {}; }
-
-    std::vector<const std::vector<uint32_t>*> postings;
-    for (Trigram t : unique) {
-        auto it = index.find(t);
-        if (it == index.end()) { allFound = false; return {}; }
-        postings.push_back(&it->second);
-    }
-
-    std::sort(postings.begin(), postings.end(),
-        [](const auto* a, const auto* b) { return a->size() < b->size(); });
-
-    std::vector<uint32_t> result;
-    result.reserve(postings[0]->size());
-    result.assign(postings[0]->begin(), postings[0]->end());
-
-    for (size_t i = 1; i < postings.size() && !result.empty(); i++) {
-        const auto& other = *postings[i];
-        std::vector<uint32_t> isect;
-        isect.reserve(std::min(result.size(), other.size()));
-        std::set_intersection(result.begin(), result.end(),
-                              other.begin(), other.end(),
-                              std::back_inserter(isect));
-        result = std::move(isect);
-    }
-    return result;
+    return intersectByTrigrams(index, ContentIndex::extractTrigrams(keyword), allFound);
 }
 
 std::vector<uint32_t> SearchEngine::intersectPostingListsMulti(
-    const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+    const PostingIndex<Trigram>& index,
     const std::vector<std::string>& segments,
     bool& allFound) {
     allFound = true;
-    // Collect trigrams from all segments and deduplicate
-    std::unordered_set<Trigram> unique;
+    std::vector<Trigram> trigrams;
     for (const auto& seg : segments) {
         auto segTrigrams = ContentIndex::extractTrigrams(seg);
-        unique.insert(segTrigrams.begin(), segTrigrams.end());
+        trigrams.insert(trigrams.end(), segTrigrams.begin(), segTrigrams.end());
     }
-    if (unique.empty()) { allFound = false; return {}; }
-
-    std::vector<const std::vector<uint32_t>*> postings;
-    for (Trigram t : unique) {
-        auto it = index.find(t);
-        if (it == index.end()) { allFound = false; return {}; }
-        postings.push_back(&it->second);
-    }
-
-    std::sort(postings.begin(), postings.end(),
-        [](const auto* a, const auto* b) { return a->size() < b->size(); });
-
-    std::vector<uint32_t> result;
-    result.reserve(postings[0]->size());
-    result.assign(postings[0]->begin(), postings[0]->end());
-
-    for (size_t i = 1; i < postings.size() && !result.empty(); i++) {
-        const auto& other = *postings[i];
-        std::vector<uint32_t> isect;
-        isect.reserve(std::min(result.size(), other.size()));
-        std::set_intersection(result.begin(), result.end(),
-                              other.begin(), other.end(),
-                              std::back_inserter(isect));
-        result = std::move(isect);
-    }
-    return result;
+    return intersectByTrigrams(index, trigrams, allFound);
 }
 
 std::vector<uint32_t> SearchEngine::unionPostingListsMulti(
-    const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+    const PostingIndex<Trigram>& index,
     const std::vector<std::string>& segments) {
     // For each segment, intersect its trigrams to get that segment's candidates.
     // Then UNION across all segments. This is safe for both AND and OR semantics
@@ -112,6 +101,26 @@ std::vector<uint32_t> SearchEngine::unionPostingListsMulti(
 // Name trigram index build / add / remove
 // ---------------------------------------------------------------------------
 
+namespace {
+/// Sort + de-duplicate a freshly extracted trigram run. Without this, repeated
+/// substrings ("aaa" in a name) are posted multiple times, which inflates every
+/// posting list and slows down intersections.
+void sortAndUnique(std::vector<Trigram>& v) {
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+}
+
+/// Release the growth headroom left by push_back. Posting lists are built by
+/// appending, so each vector keeps up to 2x the bytes it needs; at 4.6M records
+/// that headroom is hundreds of MiB.
+template <typename Map>
+void shrinkPostings(Map& index) {
+    for (auto& [_, list] : index) {
+        list.shrink_to_fit();
+    }
+}
+}  // namespace
+
 std::unordered_map<Trigram, std::vector<uint32_t>>
 SearchEngine::buildTrigramIndexFromData(const std::vector<uint8_t>& types,
                                         const StringPool& namePool) {
@@ -122,18 +131,20 @@ SearchEngine::buildTrigramIndexFromData(const std::vector<uint8_t>& types,
         if (types[i] == 0 || !namePool.isLive(i)) continue;
         scratch.clear();
         ContentIndex::extractTrigramsInto(namePool.view(i), scratch);
+        sortAndUnique(scratch);
         for (Trigram t : scratch) {
             index[t].push_back(i);
         }
     }
     for (auto& [trigram, list] : index) {
         std::sort(list.begin(), list.end());
+        list.shrink_to_fit();
     }
     return index;
 }
 
 void SearchEngine::buildTrigramIndex() {
-    nameTrigramIndex_ = buildTrigramIndexFromData(types_, namePool_);
+    nameTrigramIndex_.build(buildTrigramIndexFromData(types_, namePool_));
 }
 
 void SearchEngine::addTrigramsForRecord(uint32_t idx, const char* data, uint16_t len) {
@@ -143,12 +154,7 @@ void SearchEngine::addTrigramsForRecord(uint32_t idx, const char* data, uint16_t
     std::sort(trigrams.begin(), trigrams.end());
     trigrams.erase(std::unique(trigrams.begin(), trigrams.end()), trigrams.end());
 
-    for (Trigram t : trigrams) {
-        auto& list = nameTrigramIndex_[t];
-        // Insert in sorted position to maintain sorted posting lists
-        auto pos = std::lower_bound(list.begin(), list.end(), idx);
-        list.insert(pos, idx);
-    }
+    for (Trigram t : trigrams) nameTrigramIndex_.add(t, idx);
 }
 
 void SearchEngine::removeTrigramsForRecord(uint32_t idx) {
@@ -159,20 +165,7 @@ void SearchEngine::removeTrigramsForRecord(uint32_t idx) {
         std::string_view(namePool_.data(idx), namePool_.length(idx)), trigrams);
     std::sort(trigrams.begin(), trigrams.end());
     trigrams.erase(std::unique(trigrams.begin(), trigrams.end()), trigrams.end());
-    for (Trigram t : trigrams) {
-        auto it = nameTrigramIndex_.find(t);
-        if (it != nameTrigramIndex_.end()) {
-            auto& list = it->second;
-            // Binary search in sorted list
-            auto pos = std::lower_bound(list.begin(), list.end(), idx);
-            if (pos != list.end() && *pos == idx) {
-                list.erase(pos);
-            }
-            if (list.empty()) {
-                nameTrigramIndex_.erase(it);
-            }
-        }
-    }
+    for (Trigram t : trigrams) nameTrigramIndex_.remove(t, idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,33 +200,21 @@ SearchEngine::buildExtensionIndexFromData(const std::vector<uint8_t>& types,
 }
 
 void SearchEngine::buildExtensionIndex() {
-    extensionIndex_ = buildExtensionIndexFromData(types_, namePool_);
+    extensionIndex_.build(buildExtensionIndexFromData(types_, namePool_));
 }
 
 void SearchEngine::addExtensionForRecord(uint32_t idx) {
     if (idx >= namePool_.entryCount() || !namePool_.isLive(idx)) return;
     std::string_view ext = extractExtFromName(namePool_.data(idx), namePool_.length(idx));
     if (ext.empty()) return;
-    auto& list = extensionIndex_[std::string(ext)];
-    auto pos = std::lower_bound(list.begin(), list.end(), idx);
-    list.insert(pos, idx);
+    extensionIndex_.add(std::string(ext), idx);
 }
 
 void SearchEngine::removeExtensionForRecord(uint32_t idx) {
     if (idx >= namePool_.entryCount() || !namePool_.isLive(idx)) return;
     std::string_view ext = extractExtFromName(namePool_.data(idx), namePool_.length(idx));
     if (ext.empty()) return;
-    auto it = extensionIndex_.find(std::string(ext));
-    if (it != extensionIndex_.end()) {
-        auto& list = it->second;
-        auto pos = std::lower_bound(list.begin(), list.end(), idx);
-        if (pos != list.end() && *pos == idx) {
-            list.erase(pos);
-        }
-        if (list.empty()) {
-            extensionIndex_.erase(it);
-        }
-    }
+    extensionIndex_.remove(std::string(ext), idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,12 +230,14 @@ SearchEngine::buildPathTrigramIndexFromData(const StringPool& lowerPathPool) {
         if (!lowerPathPool.isLive(pi)) continue;
         scratch.clear();
         ContentIndex::extractTrigramsInto(lowerPathPool.view(pi), scratch);
+        sortAndUnique(scratch);
         for (Trigram t : scratch) {
             index[t].push_back(pi);
         }
     }
     for (auto& [_, list] : index) {
         std::sort(list.begin(), list.end());
+        list.shrink_to_fit();
     }
     return index;
 }
@@ -263,7 +246,17 @@ std::vector<std::vector<uint32_t>>
 SearchEngine::buildPathIdxToRecordsFromData(const std::vector<uint8_t>& types,
                                             const std::vector<uint32_t>& pathIndices,
                                             uint32_t pathPoolSize) {
+    // Count children per directory first so every list is allocated exactly once.
+    std::vector<uint32_t> counts(pathPoolSize, 0);
+    for (size_t i = 0; i < types.size(); i++) {
+        if (types[i] == 0) continue;
+        uint32_t pi = pathIndices[i];
+        if (pi < pathPoolSize) counts[pi]++;
+    }
     std::vector<std::vector<uint32_t>> mapping(pathPoolSize);
+    for (uint32_t pi = 0; pi < pathPoolSize; pi++) {
+        if (counts[pi]) mapping[pi].reserve(counts[pi]);
+    }
     for (size_t i = 0; i < types.size(); i++) {
         if (types[i] == 0) continue;
         uint32_t pi = pathIndices[i];
@@ -271,14 +264,12 @@ SearchEngine::buildPathIdxToRecordsFromData(const std::vector<uint8_t>& types,
             mapping[pi].push_back(static_cast<uint32_t>(i));
         }
     }
-    for (auto& list : mapping) {
-        std::sort(list.begin(), list.end());
-    }
+    // Appended in ascending record order — no sort pass needed.
     return mapping;
 }
 
 void SearchEngine::buildPathTrigramIndex() {
-    pathTrigramIndex_ = buildPathTrigramIndexFromData(lowerPathPool_);
+    pathTrigramIndex_.build(buildPathTrigramIndexFromData(lowerPathPool_));
 }
 
 void SearchEngine::rebuildPathIdxToRecords() {
@@ -308,19 +299,69 @@ void SearchEngine::removePathTrigramsForRecord(uint32_t idx) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bulk index removal
+//
+// Removing N records one at a time is quadratic: each per-record removal erases
+// from a posting list that is itself O(N) long, so deleting a folder of 50k
+// files costs minutes. Filtering each *affected* list once is linear instead.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// `list` and `toRemove` are both ascending; drop every element of `toRemove`
+/// from `list` in a single pass.
+void eraseSortedFrom(std::vector<uint32_t>& list, const std::vector<uint32_t>& toRemove) {
+    if (list.empty() || toRemove.empty()) return;
+    size_t out = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < list.size(); i++) {
+        while (k < toRemove.size() && toRemove[k] < list[i]) k++;
+        if (k < toRemove.size() && toRemove[k] == list[i]) continue;
+        list[out++] = list[i];
+    }
+    list.resize(out);
+}
+}  // namespace
+
+void SearchEngine::removeRecordsFromIndexesBatch(const std::vector<uint32_t>& records) {
+    if (records.empty()) return;
+
+    std::vector<Trigram> nameTrigrams;
+    std::vector<uint32_t> affectedPaths;
+    std::vector<std::string> affectedExts;
+    nameTrigrams.reserve(records.size() * 8);
+    affectedPaths.reserve(records.size());
+    for (uint32_t idx : records) {
+        if (idx >= namePool_.entryCount() || !namePool_.isLive(idx)) continue;
+        ContentIndex::extractTrigramsInto(namePool_.view(idx), nameTrigrams);
+        if (idx < pathIndices_.size() && pathIndices_[idx] < pathIdxToRecords_.size()) {
+            affectedPaths.push_back(pathIndices_[idx]);
+        }
+        std::string_view ext = extractExtFromName(namePool_.data(idx), namePool_.length(idx));
+        if (!ext.empty()) affectedExts.emplace_back(ext);
+    }
+    std::sort(nameTrigrams.begin(), nameTrigrams.end());
+    nameTrigrams.erase(std::unique(nameTrigrams.begin(), nameTrigrams.end()), nameTrigrams.end());
+    std::sort(affectedPaths.begin(), affectedPaths.end());
+    affectedPaths.erase(std::unique(affectedPaths.begin(), affectedPaths.end()), affectedPaths.end());
+    std::sort(affectedExts.begin(), affectedExts.end());
+    affectedExts.erase(std::unique(affectedExts.begin(), affectedExts.end()), affectedExts.end());
+
+    for (Trigram t : nameTrigrams) nameTrigramIndex_.removeMany(t, records);
+    for (uint32_t pi : affectedPaths) {
+        eraseSortedFrom(pathIdxToRecords_[pi], records);
+    }
+    for (const std::string& ext : affectedExts) extensionIndex_.removeMany(ext, records);
+}
+
 void SearchEngine::ensurePathTrigramsForPathIdx(uint32_t pathIdx) {
-    // Check if this pathIdx already has entries in pathTrigramIndex_
+    // New directories only ever land in the delta layer; a pathIdx is unique and
+    // is never re-interned, so there is nothing to de-duplicate against the arena.
     std::vector<Trigram> trigrams;
     ContentIndex::extractTrigramsInto(lowerPathPool_.view(pathIdx), trigrams);
     std::sort(trigrams.begin(), trigrams.end());
     trigrams.erase(std::unique(trigrams.begin(), trigrams.end()), trigrams.end());
-    for (Trigram t : trigrams) {
-        auto& list = pathTrigramIndex_[t];
-        auto pos = std::lower_bound(list.begin(), list.end(), pathIdx);
-        if (pos == list.end() || *pos != pathIdx) {
-            list.insert(pos, pathIdx);
-        }
-    }
+    for (Trigram t : trigrams) pathTrigramIndex_.add(t, pathIdx);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +434,7 @@ SearchEngine::buildTrigramIndexFromDataParallel(const std::vector<uint8_t>& type
             if (types[i] == 0 || !namePool.isLive(i)) continue;
             scratch.clear();
             ContentIndex::extractTrigramsInto(namePool.view(i), scratch);
+            sortAndUnique(scratch);
             for (Trigram tg : scratch) local[tg].push_back(i);
         }
     });
@@ -408,6 +450,7 @@ SearchEngine::buildTrigramIndexFromDataParallel(const std::vector<uint8_t>& type
         }
         partials[t].clear();
     }
+    shrinkPostings(index);
     return index;
 }
 
@@ -432,6 +475,7 @@ SearchEngine::buildPathTrigramIndexFromDataParallel(const StringPool& lowerPathP
             if (!lowerPathPool.isLive(pi)) continue;
             scratch.clear();
             ContentIndex::extractTrigramsInto(lowerPathPool.view(pi), scratch);
+            sortAndUnique(scratch);
             for (Trigram tg : scratch) local[tg].push_back(pi);
         }
     });
@@ -444,6 +488,7 @@ SearchEngine::buildPathTrigramIndexFromDataParallel(const StringPool& lowerPathP
         }
         partials[t].clear();
     }
+    shrinkPostings(index);
     return index;
 }
 
@@ -479,5 +524,6 @@ SearchEngine::buildExtensionIndexFromDataParallel(const std::vector<uint8_t>& ty
         }
         partials[t].clear();
     }
+    shrinkPostings(index);
     return index;
 }

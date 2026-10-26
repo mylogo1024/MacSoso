@@ -343,8 +343,11 @@ void IndexPersistence::startAutoCompaction(double intervalSec, std::shared_ptr<F
     timer_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, timerQueue_);
 
     uint64_t intervalNs = static_cast<uint64_t>(intervalSec * NSEC_PER_SEC);
+    // Fire the first tick early: right after startup the columns and pools still
+    // carry the doubling headroom from the bulk load, which is the largest chunk
+    // of avoidable memory an otherwise idle daemon holds.
     dispatch_source_set_timer(timer_,
-                              dispatch_time(DISPATCH_TIME_NOW, intervalNs),
+                              dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC),
                               intervalNs,
                               30 * NSEC_PER_SEC);
 
@@ -352,6 +355,9 @@ void IndexPersistence::startAutoCompaction(double intervalSec, std::shared_ptr<F
     dispatch_source_set_event_handler(timer_, ^{
         uint64_t eventId = watcher ? watcher->getLastEventId() : 0;
         self->flush(eventId);
+        // Incremental updates grow the SoA columns and string pools by doubling;
+        // hand the headroom back so an idle daemon stops paying for it.
+        if (self->engine_) self->engine_->trimCapacity();
         double newInterval = self->computeAdaptiveInterval();
         self->rescheduleTimer(newInterval);
     });

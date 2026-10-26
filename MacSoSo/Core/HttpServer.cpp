@@ -317,7 +317,7 @@ std::string HttpServer::route(const HttpRequest& req) {
         } else if (req.path == "/api/recent") {
             return handleRecent(req.query);
         } else if (req.path == "/api/status") {
-            return handleStatus();
+            return handleStatus(req.query);
         } else if (req.path == "/api/health") {
             return handleHealth();
         } else if (req.path == "/api/content/config") {
@@ -518,8 +518,21 @@ std::string HttpServer::handleRecent(
     return jsonResponse(200, json.str());
 }
 
-std::string HttpServer::handleStatus() {
+std::string HttpServer::handleStatus(const std::unordered_map<std::string, std::string>& query) {
     auto engine = getEngine_();
+    if (auto it = query.find("debug"); it != query.end() && it->second == "memory" && engine) {
+        std::string profile = engine->memoryProfile();
+        std::string escaped;
+        escaped.reserve(profile.size() + 16);
+        for (char c : profile) {
+            if (c == '\n') escaped += "\\n";
+            else if (c == '"') escaped += "\\\"";
+            else escaped += c;
+        }
+        std::ostringstream json;
+        json << "{\"memoryProfile\":\"" << escaped << "\"}";
+        return jsonResponse(200, json.str());
+    }
     auto contentIndex = getContentIndex_();
     std::ostringstream json;
     json << "{\"recordCount\":" << (engine ? engine->recordCount() : 0)

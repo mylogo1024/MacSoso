@@ -63,9 +63,9 @@ size_t SearchEngine::estimateTrigramCost(const std::string& keyword) const {
 
     size_t minSize = SIZE_MAX;
     for (Trigram t : unique) {
-        auto it = nameTrigramIndex_.find(t);
-        if (it == nameTrigramIndex_.end()) return 0; // trigram absent → 0 candidates
-        minSize = std::min(minSize, it->second.size());
+        uint32_t n = nameTrigramIndex_.count(t);
+        if (n == 0) return 0; // trigram absent → 0 candidates
+        minSize = std::min(minSize, static_cast<size_t>(n));
     }
     return minSize;
 }
@@ -84,10 +84,8 @@ void SearchEngine::treeWalkDown(uint32_t dirIdx, const ParsedQuery& pq,
     fullDirPath += std::string(namePool_.data(dirIdx), namePool_.length(dirIdx));
 
     // Look up children of this directory
-    auto it = lowerPathLookup_.find(fullDirPath);
-    if (it == lowerPathLookup_.end()) return;
-
-    uint32_t childPathIdx = it->second;
+    uint32_t childPathIdx = findLowerPathIdxUnlocked(fullDirPath);
+    if (childPathIdx == PathIndexTable::kNotFound) return;
     if (childPathIdx >= pathIdxToRecords_.size()) return;
     const auto& childRecords = pathIdxToRecords_[childPathIdx];
 

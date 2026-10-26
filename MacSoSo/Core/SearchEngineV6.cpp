@@ -40,58 +40,18 @@ void SearchEngine::loadRecordsV6(StringPool&& origNamePool,
     devIds_ = std::move(devIds);
 
     // Rebuild pathLookup_ and lowerPathLookup_ from pathPool_ entries
-    pathLookup_.clear();
-    lowerPathLookup_.clear();
-    pathLookup_.reserve(pathPool_.entryCount());
-    lowerPathLookup_.reserve(pathPool_.entryCount());
-    for (uint32_t i = 0; i < pathPool_.entryCount(); i++) {
-        if (pathPool_.isLive(i)) {
-            pathLookup_[pathPool_.str(i)] = i;
-            lowerPathLookup_[lowerPathPool_.str(i)] = i;
-        }
-    }
+    rebuildPathLookupsUnlocked();
 
-    // Build pathIndex_ (lowercase full path -> record index)
-    // Parallelize full-path construction using string_view to avoid allocations
-    unsigned numThreads = std::thread::hardware_concurrency();
-    if (numThreads < 1) numThreads = 1;
-    if (numThreads > 32) numThreads = 32;
-    size_t chunkSize = (n + numThreads - 1) / numThreads;
-    std::vector<std::string> loweredPaths(n);
-    {
-        std::vector<std::thread> pathThreads;
-        pathThreads.reserve(numThreads);
-        for (unsigned t = 0; t < numThreads; t++) {
-            size_t start = t * chunkSize;
-            size_t end = std::min(start + chunkSize, static_cast<size_t>(n));
-            if (start >= end) break;
-            pathThreads.emplace_back([this, &loweredPaths, start, end] {
-                for (size_t i = start; i < end; i++) {
-                    uint32_t idx = static_cast<uint32_t>(i);
-                    loweredPaths[i] = makeFullPath(lowerPathPool_.view(pathIndices_[idx]),
-                                                   namePool_.view(idx));
-                }
-            });
-        }
-        for (auto& th : pathThreads) th.join();
-    }
-
-    // Insert into pathIndex_ and merge tombstone dedup (last-wins overwrites)
-    pathIndex_.clear();
-    pathIndex_.reserve(n);
-    for (uint32_t i = 0; i < n; i++) {
-        if (types_[i] == 0) continue;
-        pathIndex_[std::move(loweredPaths[i])] = i;
-    }
+    // Build pathIndex_ (lowercase full path -> record index), tombstone-deduped
+    // last-wins
+    buildPathIndexUnlocked(n);
 
     // Tombstone orphaned duplicates: records not in pathIndex_ as winners
     uint32_t actualLive = 0;
     {
         // Collect winner indices from pathIndex_ values
         std::vector<bool> isWinner(n, false);
-        for (const auto& [_, idx] : pathIndex_) {
-            isWinner[idx] = true;
-        }
+        pathIndex_.forEach([&](uint64_t, uint32_t idx) { isWinner[idx] = true; });
         for (uint32_t i = 0; i < n; i++) {
             if (types_[i] == 0) continue;
             if (isWinner[i]) {
@@ -158,17 +118,26 @@ void SearchEngine::completePhase2() {
     auto recentCache = buildRecentCacheFromData(snapTypes, snapModTimes, kRecentCacheSize);
     auto extensionIndex = buildExtensionIndexFromDataParallel(snapTypes, snapNamePool, numThreads);
 
+    // Pack the uncompressed maps into the compact varint arenas before taking the
+    // swap lock; `build()` frees each posting list as its run is encoded.
+    PostingIndex<Trigram> nameTrigramIndex;
+    nameTrigramIndex.build(std::move(trigramIndex));
+    PostingIndex<Trigram> pathTrigram;
+    pathTrigram.build(std::move(pathTrigramIndex));
+    PostingIndex<std::string> extIndex;
+    extIndex.build(std::move(extensionIndex));
+
     LOG_INFO("SearchEngine", "Phase 2: indices built, swapping under lock...");
 
     // Swap under unique lock and replay mutations that occurred during build
     {
         std::unique_lock lock(mutex_);
 
-        nameTrigramIndex_ = std::move(trigramIndex);
-        pathTrigramIndex_ = std::move(pathTrigramIndex);
+        nameTrigramIndex_ = std::move(nameTrigramIndex);
+        pathTrigramIndex_ = std::move(pathTrigram);
         pathIdxToRecords_ = std::move(pathIdxToRecords);
         recentCache_ = std::move(recentCache);
-        extensionIndex_ = std::move(extensionIndex);
+        extensionIndex_ = std::move(extIndex);
 
         // Replay records added during Phase 2 build
         uint32_t currentSize = static_cast<uint32_t>(types_.size());
@@ -197,7 +166,7 @@ void SearchEngine::completePhase2() {
         phase2Pending_.store(false, std::memory_order_release);
 
         LOG_INFO("SearchEngine", "Phase 2 complete: replayed " << replayCount
-                 << " mutations, trigram indices active");
+                 << " mutations, trigram indices active\n" << memoryProfileUnlocked());
     }
 }
 

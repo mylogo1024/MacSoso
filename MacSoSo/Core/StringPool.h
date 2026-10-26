@@ -87,6 +87,12 @@ public:
     /// Total size of the raw buffer in bytes.
     size_t rawSize() const { return buffer_.size(); }
 
+    /// Allocated (not merely used) bytes of the character buffer.
+    size_t bufferCapacity() const { return buffer_.capacity(); }
+
+    /// Allocated bytes of the entry table.
+    size_t entryCapacityBytes() const { return entries_.capacity() * sizeof(Entry); }
+
     /// Pointer to entries array.
     const Entry* entries() const { return entries_.data(); }
 
@@ -130,6 +136,31 @@ public:
     void clear() {
         buffer_.clear();
         entries_.clear();
+    }
+
+    /// Give back unused capacity. Appending doubles the buffers, so a pool that
+    /// stopped growing still holds up to 2x the bytes it needs.
+    /// Give back the capacity that append-by-doubling left behind, but keep a
+    /// slice of slack: shrinking to the exact size would make the very next
+    /// append double all over again, so the daemon would pay a full copy per
+    /// idle cycle and end up back at 2x.
+    void shrinkWithSlack(size_t slackBytes) {
+        const size_t bufTarget = buffer_.size() +
+            std::max<size_t>(buffer_.size() / 16, slackBytes);
+        if (buffer_.capacity() > bufTarget + bufTarget / 8) {
+            std::vector<char> shrunk;
+            shrunk.reserve(bufTarget);
+            shrunk.insert(shrunk.end(), buffer_.begin(), buffer_.end());
+            buffer_.swap(shrunk);
+        }
+        const size_t entryTarget = entries_.size() +
+            std::max<size_t>(entries_.size() / 16, slackBytes / sizeof(Entry));
+        if (entries_.capacity() > entryTarget + entryTarget / 8) {
+            std::vector<Entry> shrunk;
+            shrunk.reserve(entryTarget);
+            shrunk.insert(shrunk.end(), entries_.begin(), entries_.end());
+            entries_.swap(shrunk);
+        }
     }
 
     /// Create a compacted copy containing only live entries matching liveMask.

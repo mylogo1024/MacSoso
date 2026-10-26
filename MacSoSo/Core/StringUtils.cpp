@@ -6,15 +6,15 @@
 
 namespace me {
 
-std::string toLower(const std::string& s) {
+std::string toLower(std::string_view s) {
     // ASCII fast-path — skip CoreFoundation for pure-ASCII strings
     // (>95% of filenames on typical systems). Uses NEON SIMD on ARM64.
     bool allAscii = true;
-    for (unsigned char c : s) {
-        if (c >= 128) { allAscii = false; break; }
+    for (char c : s) {
+        if (static_cast<unsigned char>(c) >= 128) { allAscii = false; break; }
     }
     if (allAscii) {
-        std::string result = s;
+        std::string result(s);
         simdToLowerAscii(result.data(), result.size());
         return result;
     }

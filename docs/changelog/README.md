@@ -155,6 +155,9 @@
 | [148](148-project-rename.md) | chore | 项目更名为 MacSoSo | 2026-10-23 |
 | [149](149-app-icon-replacement.md) | chore | 更换 MacSoSo 应用图标 | 2026-10-23 |
 | [150](150-project-path-and-v1-release.md) | chore | 切换项目路径并准备 v1.0.0 首次发布 | 2026-10-26 |
+| [151](151-app-icon-magnifier.md) | chore | 更换为橙色放大镜应用图标 | 2026-10-26 |
+| [152](152-idle-memory-and-bulk-rescan.md) | performance | 后台常驻内存压缩与批量重扫提速 | 2026-10-26 |
+| [153](153-posting-index-varint-arena.md) | performance | 倒排链改为单块 arena 的 delta + varint 压缩存储 | 2026-10-26 |
 
 ## 统计
 
@@ -162,12 +165,12 @@
 |------|------|
 | bugfix | 51 |
 | feature | 34 |
-| performance | 31 |
+| performance | 33 |
 | refactor | 17 |
 | test | 5 |
 | docs | 2 |
-| chore | 4 |
-| **合计** | **144 条 (137 个编号, 7 组重复编号各 2 条)** |
+| chore | 5 |
+| **合计** | **147 条 (140 个编号, 7 组重复编号各 2 条)** |
 
 ---
 
@@ -180,4 +183,4 @@
 | 2026-04-18 | 22 |
 | 2026-04-19 | 38 |
 | 2026-10-23 | 4 |
-| 2026-10-26 | 1 |
+| 2026-10-26 | 4 |

@@ -126,3 +126,62 @@
   推送到远端，`workflow_dispatch` 只负责选择已有标签，不会自动创建标签。
 - Release 工作流新增 `preflight` 任务，会在构建前校验标签是否存在，并给出
   缺失标签时的修复命令。
+
+## 9. 应用图标二次替换
+
+2026-10-26 按维护者提供的新源图（256×256 橙色放大镜，去掉上一版的蓝色
+圆球）重新生成 AppIcon 全部尺寸，源图保存在
+`assets/appicon/macsoso_icon.png`，构建脚本与流程沿用条目 149 的
+`scripts/generate_app_icons.py` 与 `make icons`。
+
+## 10. 常驻内存与批量重扫性能
+
+上游把路径索引保存为 `unordered_map<std::string, uint32_t>`，后台常驻时
+内存显著高于预期；目录级批量删除又在有序倒排链上逐条 `erase`。2026-10-26
+的改造（详见 changelog 条目 152）：
+
+- 新增 `MacSoSo/Core/PathIndexTable.h`：16 字节槽的开放寻址表，槽内只存
+  哈希与值，命中后回查字符串池验证；`pathIndex_`、`pathLookup_`、
+  `lowerPathLookup_` 全部改用该表，并支持目录 + 文件名分段喂入哈希，
+  批量加载不再拼接整条路径字符串。
+- 新增 `SearchEngine::removeRecordsFromIndexesBatch()`，把子树删除从
+  「每条记录在每条链里线性搬移」改为「每条受影响链过滤一遍」，
+  5 万文件子树重扫从约 3.6 s 降到约 30 ms。
+- `trimCapacity()` 改为带余量收缩（池 4 MiB、列 6.4 万条、倒排链 8～16 个
+  元素），并新增对 trigram / 扩展名倒排链容量的回收；自动压缩首次 tick 由
+  30 s 延后到 60 s。
+- 新增 `SearchEngine::memoryProfile()`，通过
+  `/api/status?debug=memory` 输出分项容量，便于持续跟踪。
+- 实测同一份约 510 万条记录的生产索引：引擎画像 3309 MiB → 1556 MiB，
+  进程脏页 3243 MB → 约 1.7～1.8 GB；冷查询 0.03～13 ms，热查询命中结果
+  缓存约 0 ms。
+- 未采纳：高频 trigram 倒排链裁剪（只值约 165 MiB 且拖慢常见词查询）、
+  `malloc_zone_pressure_relief()`（实测无法归还小块空闲页）。
+
+## 11. 倒排链 arena 压缩
+
+上游的三张倒排表是 `unordered_map<Key, vector<uint32_t>>`：每个 posting 固定
+4 字节，再加按倍扩容留下的容量冗余和每 key 一个小块分配。条目 152 做完路径
+索引与容量回收后，这三项仍占引擎画像的 43%（约 670 MiB）。2026-10-26 的改造
+（详见 changelog 条目 153）：
+
+- 新增 `MacSoSo/Core/PostingIndex.h`：全部 posting 以 delta + LEB128 varint
+  编进单块字节 arena，key 只映射到 12 字节描述符 `{offset, bytes, count}`；
+  构建时逐链编码并即时释放源链，编码峰值不同时持有「中间 map + 完整 arena」。
+- `nameTrigramIndex_`、`pathTrigramIndex_`、`extensionIndex_` 换成
+  `PostingIndex<>`。构建之后的实时增删写进 delta 层，Phase 2 完成与 COW
+  压缩在**取写锁之前**把中间 map 编码成 arena，锁内只做 move 交换；
+  `trimCapacity()` 在增量攒到阈值（≥ 262144 条，或 ≥ 基准的 1/4）时调用
+  `foldDelta()` 把增量折回 arena，避免常驻进程把每 key 一个 vector 的开销
+  重新长回来。
+- 查询侧只物化最稀有的那条链，其余 trigram 用 `intersectWith()` 边解码边求交
+  （探测一条两百万 posting 的链零分配），并加了「收窄代价 > 16 倍收益即止损」
+  的规则：varint 链不能随机访问，整链解码约 2 ns/posting，而多留一个候选只需
+  约 20 ns 校验，多余的收窄对常见关键词几乎不减少候选。删除的 posting 留在
+  arena 里，由候选循环既有的 `types_[idx] == 0` 墓碑过滤兜住。
+- 实测同一份约 517 万条记录的生产索引：引擎画像 1556.3 MiB → 1092.5 MiB，
+  倒排三项 670 → 202.6 MiB（平均每 posting 约 1.5 字节），进程脏页
+  1818～1848 MB → 1168 MB。
+- 未采纳：基于 24 位 trigram 直接计数数组的两趟 CSR 构建（只影响启动峰值，
+  需要重写 Phase 2 与压缩路径）；不同 key 数量级远小于预期（name 仅 8.0 万、
+  path 仅 4.5 万个 trigram），所以「扁平 key 表 + 稠密 CSR」省不出多少内存。

@@ -120,10 +120,8 @@ void SearchEngine::queryDirList(const ParsedQuery& pq,
         fullDirPath += std::string(namePool_.data(dirIdx), namePool_.length(dirIdx));
 
         // Look up this full path in pathLookup_ to find its pathPool index
-        auto it = pathLookup_.find(fullDirPath);
-        if (it == pathLookup_.end()) continue;
-
-        uint32_t childPathIdx = it->second;
+        uint32_t childPathIdx = findPathIdxUnlocked(fullDirPath);
+        if (childPathIdx == PathIndexTable::kNotFound) continue;
         if (childPathIdx >= pathIdxToRecords_.size()) continue;
 
         const auto& childRecords = pathIdxToRecords_[childPathIdx];

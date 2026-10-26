@@ -1,6 +1,8 @@
 #pragma once
 #include "FileRecord.h"
 #include "ContentIndex.h" // for Trigram type and extractTrigrams/makeTrigram
+#include "PathIndexTable.h"
+#include "PostingIndex.h"
 #include "StringPool.h"
 #include "SIMDSearch.h"
 #include <vector>
@@ -207,6 +209,15 @@ public:
     /// Number of entries currently held in the rendered-result cache.
     /// Exposed for diagnostics and tests.
     size_t queryCacheSize() const { return queryCache_.size(); }
+
+    /// Per-structure heap usage breakdown (MiB) of the in-memory index.
+    /// Logged once after startup; also served by the status API.
+    std::string memoryProfile() const;
+
+    /// Give back capacity that bulk loading and appending left behind.
+    /// Idempotent and cheap when nothing over-allocates; call it once the index
+    /// has settled so an idle daemon does not pay for vector growth headroom.
+    void trimCapacity();
 
     /// Advanced query: evaluate an AST with boolean operators, quoted phrases,
     /// and filter nodes. Uses trigram index for TERM nodes, then applies
@@ -429,9 +440,12 @@ private:
     std::vector<int64_t>  modTimes_;       // modification time (Unix epoch)
     std::vector<uint64_t> inodes_;         // inode number
     std::vector<int32_t>  devIds_;         // device ID
-    std::unordered_map<std::string, uint32_t> pathLookup_; // path string -> pathPool_ index
-    std::unordered_map<std::string, uint32_t> lowerPathLookup_; // lowered path -> pathPool_ index
-    std::unordered_map<std::string, uint32_t> pathIndex_; // fullPath -> record index
+    /// Directory interning tables. Keys are the hash of a directory as it is
+    /// stored in the matching pool; the pool itself owns the text, so nothing is
+    /// duplicated here.
+    PathIndexTable pathLookup_;       // path hash -> pathPool_ index
+    PathIndexTable lowerPathLookup_;  // lowered path hash -> pathPool_ index
+    PathIndexTable pathIndex_;      // lowercase full path hash -> record index
     std::atomic<uint32_t> liveCount_{0};
     mutable std::shared_mutex mutex_;
 
@@ -443,18 +457,62 @@ private:
     void invalidateQueryCache() { queryCache_.clear(); }
 
     // Trigram inverted index for fast filename search
-    std::unordered_map<Trigram, std::vector<uint32_t>> nameTrigramIndex_; // trigram -> record indices
+    PostingIndex<Trigram> nameTrigramIndex_;   // trigram -> record indices
 
     // Path trigram index: two-level lookup for fast path-only matching
-    std::unordered_map<Trigram, std::vector<uint32_t>> pathTrigramIndex_; // trigram -> sorted pathIdx
+    PostingIndex<Trigram> pathTrigramIndex_;   // trigram -> sorted pathIdx
     std::vector<std::vector<uint32_t>> pathIdxToRecords_; // pathIdx -> sorted record indices
 
     // Extension index: extension string -> sorted record indices (files only)
-    std::unordered_map<std::string, std::vector<uint32_t>> extensionIndex_;
+    PostingIndex<std::string> extensionIndex_;
 
     /// Intern a directory path into pathPool_ and lowerPathPool_. Returns pathPool_ index.
     /// Deduplicates via pathLookup_. Must be called under unique_lock.
     uint32_t internPath(const std::string& path);
+
+    /// --- pathIndex_ helpers (lowercase full path -> record index) -----------
+    /// All three take the path in already-lowered form and verify hits against
+    /// the record's own directory + name, so a hash collision cannot alias two
+    /// different files. Caller must hold mutex_.
+
+    uint32_t findRecordByLoweredPathUnlocked(std::string_view loweredFull) const;
+    void indexRecordUnlocked(std::string_view loweredFull, uint32_t idx);
+    bool unindexRecordUnlocked(std::string_view loweredFull);
+
+    /// Hash of record `idx`'s lowercase full path, folded straight out of the
+    /// pools so a bulk load never materialises one joined string per record.
+    uint64_t loweredPathHashUnlocked(uint32_t idx) const;
+
+    /// Bulk-load counterpart of indexRecordUnlocked() for callers that hold only
+    /// record indices. Last writer wins on duplicates, like the old map.
+    void indexRecordByIdxUnlocked(uint32_t idx);
+
+    /// True when both records' interned directory + name are identical.
+    bool sameLoweredPathUnlocked(uint32_t a, uint32_t b) const;
+
+    /// Drop record `idx` from pathIndex_ using its own pooled path halves, so a
+    /// bulk removal never builds a joined path string.
+    bool unindexRecordByIdxUnlocked(uint32_t idx);
+
+    /// --- pathLookup_ / lowerPathLookup_ helpers (directory -> pathPool_ index) ---
+    /// Keys are hashes only; a hit is confirmed against the pool text, so a
+    /// collision cannot alias two directories. Return PathIndexTable::kNotFound
+    /// when absent. Caller must hold mutex_.
+    uint32_t findPathIdxUnlocked(std::string_view path) const;
+    uint32_t findLowerPathIdxUnlocked(std::string_view loweredPath) const;
+    /// Register a freshly interned pathPool_/lowerPathPool_ entry in both tables.
+    void insertPathLookupUnlocked(uint32_t pIdx);
+    /// Rebuild both lookup tables from the live pathPool_ entries.
+    void rebuildPathLookupsUnlocked();
+
+    /// Bulk-build pathIndex_ over records [0, n): hashes are folded in parallel,
+    /// insertion stays serial so the table is sized once.
+    void buildPathIndexUnlocked(size_t n);
+
+    /// Record indices whose full path equals `lowerPrefix` or lies beneath it at
+    /// a path-component boundary. Result is a snapshot, safe to mutate the index
+    /// while consuming it. Caller must hold mutex_.
+    std::vector<uint32_t> collectSubtreeRecordsUnlocked(const std::string& lowerPrefix) const;
 
     /// Tombstone a record at idx: clear SoA columns. Must be called under unique_lock.
     void tombstoneAt(uint32_t idx);
@@ -472,6 +530,13 @@ private:
     void addTrigramsForRecord(uint32_t idx, const char* data, uint16_t len);
     /// Remove trigrams for a single record from the index
     void removeTrigramsForRecord(uint32_t idx);
+
+    /// Bulk variant of removeTrigramsForRecord()/removePathTrigramsForRecord()/
+    /// removeExtensionForRecord(): filters every affected posting list once
+    /// instead of once per record, which turns a folder-sized removal from
+    /// quadratic into linear. `records` must be sorted ascending and still
+    /// live, so call it before tombstoning. Caller must hold unique_lock.
+    void removeRecordsFromIndexesBatch(const std::vector<uint32_t>& records);
 
     /// Build extension index from namePool_ (maps extension -> sorted record indices)
     void buildExtensionIndex();
@@ -513,6 +578,9 @@ public:
     static bool pathSegmentsMatch(std::string_view dirPath,
                                   const std::vector<PathSegment>& segments);
 private:
+
+    /// Memory breakdown. Caller must hold mutex_.
+    std::string memoryProfileUnlocked() const;
 
     /// Estimate trigram candidate count for a keyword (min posting list size).
     /// Returns SIZE_MAX if keyword is < 3 chars, 0 if any trigram not in index.
@@ -575,13 +643,13 @@ private:
     /// Returns sorted candidate indices, or empty if any trigram is missing.
     /// Sets allFound to false if any trigram is not in the index.
     static std::vector<uint32_t> intersectPostingLists(
-        const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+        const PostingIndex<Trigram>& index,
         const std::string& keyword,
         bool& allFound);
 
     /// Intersect trigrams from multiple literal segments for complex glob pre-filtering.
     static std::vector<uint32_t> intersectPostingListsMulti(
-        const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+        const PostingIndex<Trigram>& index,
         const std::vector<std::string>& segments,
         bool& allFound);
 
@@ -589,7 +657,7 @@ private:
     /// Each atom's trigrams are intersected internally, then results are unioned.
     /// Safe for both AND and OR semantics from FilteredRE2.
     static std::vector<uint32_t> unionPostingListsMulti(
-        const std::unordered_map<Trigram, std::vector<uint32_t>>& index,
+        const PostingIndex<Trigram>& index,
         const std::vector<std::string>& segments);
 
     /// Build full path in a reusable buffer: path + '/' + name.

@@ -1095,7 +1095,7 @@ std::vector<uint32_t> SearchEngine::queryAdvanced(const std::string& input,
                 stage1RawCandCount > totalSize / 10 ? "tooManyCands" : "unknown")
             << " phase2Pending=" << p2
             << " indexEmpty=" << idxEmpty
-            << " indexBuckets=" << nameTrigramIndex_.size()
+            << " indexKeys=" << nameTrigramIndex_.keyCount()
             << " allFound=" << stage1AllFound
             << " rawCands=" << stage1RawCandCount
             << " threshold=" << totalSize / 10
@@ -1153,10 +1153,10 @@ std::vector<uint32_t> SearchEngine::queryAdvanced(const std::string& input,
         auto extValues = extractExtFilterValues(*ast);
         if (!extValues.empty()) {
             // Union posting lists for all requested extensions
+            std::vector<uint32_t> extRun;
             for (const auto& ext : extValues) {
-                auto it = extensionIndex_.find(ext);
-                if (it != extensionIndex_.end()) {
-                    extCands.insert(extCands.end(), it->second.begin(), it->second.end());
+                if (extensionIndex_.decode(ext, extRun)) {
+                    extCands.insert(extCands.end(), extRun.begin(), extRun.end());
                 }
             }
             if (extValues.size() > 1) {
@@ -1819,8 +1819,8 @@ void SearchEngine::applyAggregateFilters(std::vector<Match>& matches,
                            lowerPathPool_.length(parentPathIdx));
             if (ownPath.empty() || ownPath.back() != '/') ownPath.push_back('/');
             ownPath.append(namePool_.data(idx), namePool_.length(idx));
-            auto it = lowerPathLookup_.find(ownPath);
-            if (it != lowerPathLookup_.end()) ownPathIdx = it->second;
+            uint32_t found = findLowerPathIdxUnlocked(ownPath);
+            if (found != PathIndexTable::kNotFound) ownPathIdx = found;
         }
 
         uint32_t childTotal = 0, childFiles = 0, childFolders = 0;
