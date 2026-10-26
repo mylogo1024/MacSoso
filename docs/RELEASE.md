@@ -18,15 +18,15 @@ brew install re2 abseil
 ./scripts/package_release.sh
 
 # 指定架构与版本
-./scripts/package_release.sh --arch arm64 --version 1.3.0
-./scripts/package_release.sh --arch x86_64 --version 1.3.0
+./scripts/package_release.sh --arch arm64 --version 1.0.0
+./scripts/package_release.sh --arch x86_64 --version 1.0.0
 ```
 
 产物位于 `dist/`：
 
 ```
-MacSoSo-1.3.0-arm64.dmg
-MacSoSo-1.3.0-arm64.dmg.sha256
+MacSoSo-1.0.0-arm64.dmg
+MacSoSo-1.0.0-arm64.dmg.sha256
 ```
 
 脚本会：
@@ -57,7 +57,7 @@ MacSoSo-1.3.0-arm64.dmg.sha256
 
 触发方式：
 
-- 推送形如 `v1.3.0` 的标签。
+- 推送形如 `v1.0.0` 的标签。
 - 在 Actions 页面手动运行 `Release`，输入一个已存在的标签。
 
 流程：
@@ -72,16 +72,17 @@ MacSoSo-1.3.0-arm64.dmg.sha256
 
 ### 首次推送与发布
 
-本地仓库尚未配置远端时：
+当前仓库已配置远端 `https://github.com/mylogo1024/MacSoso.git`。若本地仓库
+尚未配置远端：
 
 ```bash
 # 在 GitHub 创建空仓库后
-git remote add origin https://github.com/<你的账号>/MacSoSo.git
+git remote add origin https://github.com/mylogo1024/MacSoso.git
 git push -u origin main
 
 # 打标签即触发线上构建与 Release
-git tag -a v1.3.0 -m "MacSoSo 1.3.0"
-git push origin v1.3.0
+git tag -a v1.0.0 -m "MacSoSo 1.0.0"
+git push origin v1.0.0
 ```
 
 工作流需要仓库的 `contents: write` 权限（文件内已声明）；若仓库设置了
@@ -107,13 +108,13 @@ xattr -dr com.apple.quarantine /Applications/MacSoSo.app
 然后对 DMG 公证并装订：
 
 ```bash
-xcrun notarytool submit dist/MacSoSo-1.3.0-arm64.dmg \
+xcrun notarytool submit dist/MacSoSo-1.0.0-arm64.dmg \
   --apple-id "you@example.com" \
   --team-id "TEAMID" \
   --password "app-specific-password" \
   --wait
 
-xcrun stapler staple dist/MacSoSo-1.3.0-arm64.dmg
+xcrun stapler staple dist/MacSoSo-1.0.0-arm64.dmg
 ```
 
 若要在 CI 中自动签名/公证，可在 workflow 的构建步骤前导入

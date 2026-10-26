@@ -247,7 +247,7 @@ curl "http://localhost:19860/api/status"                          # 索引状态
 
 ```bash
 brew install re2 abseil
-git clone https://github.com/your-account/MacSoSo.git && cd MacSoSo
+git clone https://github.com/mylogo1024/MacSoso.git && cd MacSoso
 
 # 构建并打包（自动内嵌 re2/abseil 动态库、生成 DMG 与 SHA256）
 ./scripts/package_release.sh --arch arm64

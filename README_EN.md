@@ -234,7 +234,7 @@ curl "http://localhost:19860/api/status"                          # Index status
 
 ```bash
 brew install re2 abseil
-git clone https://github.com/your-account/MacSoSo.git && cd MacSoSo
+git clone https://github.com/mylogo1024/MacSoso.git && cd MacSoso
 
 # Build + package (bundles re2/abseil, emits DMG and SHA256)
 ./scripts/package_release.sh --arch arm64

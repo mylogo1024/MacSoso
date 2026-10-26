@@ -114,3 +114,15 @@
 - 替换 `MacSoSo/Assets.xcassets/AppIcon.appiconset/` 中的
   `icon_16.png` 至 `icon_1024.png`；README 图标与构建后的 `AppIcon.icns`
   会随之更新。
+
+## 8. 发布仓库与首次版本
+
+2026-10-26 将本地项目根目录切换为
+`/Volumes/mac/project_new/Everything/MacSoso`，并将首次公开发布版本调整为
+`v1.0.0`：
+
+- 当前远端仓库为 `https://github.com/mylogo1024/MacSoso.git`。
+- `Info.plist` 使用 `1.0.0 (1)`；GitHub Actions 的 Release 标签也必须先
+  推送到远端，`workflow_dispatch` 只负责选择已有标签，不会自动创建标签。
+- Release 工作流新增 `preflight` 任务，会在构建前校验标签是否存在，并给出
+  缺失标签时的修复命令。

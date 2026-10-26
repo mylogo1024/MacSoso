@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (for example v1.3.0)"
+        description: "Existing tag to build and publish (for example v1.0.0)"
         required: true
         type: string
 
@@ -23,12 +23,43 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: 1
 
 jobs:
+  preflight:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate tag
+        id: version
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Release tag '$TAG' does not exist in origin. Create and push it first:" >&2
+            echo "  git tag -a $TAG -m \"MacSoSo ${TAG#v}\" && git push origin $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
   test:
     name: Unit tests
+    needs: preflight
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
           fetch-depth: 0
 
       - name: Install dependencies
@@ -39,7 +70,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }} DMG
-    needs: test
+    needs: [preflight, test]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -53,21 +84,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
           fetch-depth: 0
-
-      - name: Resolve version
-        id: version
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-        shell: bash
-        run: |
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: brew install re2 abseil
@@ -75,7 +93,7 @@ jobs:
       - name: Build and package
         run: |
           ./scripts/package_release.sh \
-            --version "${{ steps.version.outputs.version }}" \
+            --version "${{ needs.preflight.outputs.version }}" \
             --arch "${{ matrix.arch }}"
 
       - name: Verify checksum
@@ -94,12 +112,12 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [preflight, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: refs/tags/${{ needs.preflight.outputs.tag }}
           fetch-depth: 0
 
       - name: Download release assets
@@ -109,23 +127,10 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Resolve version
-        id: version
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-        shell: bash
-        run: |
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
       - name: Compose release notes
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
@@ -179,8 +184,8 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
         shell: bash
         run: |
           ls -lh dist
