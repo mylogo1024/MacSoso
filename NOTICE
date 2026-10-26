@@ -1,0 +1,41 @@
+MacSoSo
+Copyright (c) 2024-2026 MacEverything Contributors
+Copyright (c) 2026 MacSoSo Contributors (modifications)
+
+This distribution is a modified derivative of MacEverything by joshua-wu:
+
+    https://github.com/joshua-wu/MacEverything
+
+Upstream baseline commit: 26f0332
+Upstream license: MIT (see LICENSE)
+
+The upstream project is itself inspired by voidtools Everything. This fork is
+an independent modification and is not affiliated with, endorsed by, or
+sponsored by voidtools. "Everything" is a trademark of its respective owner;
+it is used here only to describe search-syntax compatibility.
+
+Summary of modifications since the upstream baseline
+-----------------------------------------------------
+- Renamed the project and product from MacEverything to MacSoSo. This includes
+  the Xcode project/targets/schemes, source and test directories, app and MCP
+  binaries, bundle identifier (com.macsoso.app), cache/log paths, MCP server
+  key, DMG names, and documentation. Upstream attribution is preserved.
+- Search syntax and matching semantics aligned with voidtools Everything:
+  OR precedence, <> grouping, quoting, wildcard/path rules, filters,
+  functions, modifiers, date filters, aggregate/duplicate filters, sorting.
+- Everything-style desktop UI: four-column result table, column sorting,
+  persistent search-option toggles, bottom status bar, full result set.
+- DirectoryScanner now includes local user volumes under /Volumes (APFS,
+  HFS, exFAT, FAT, NTFS, UDF, ISO) while still skipping network, autofs,
+  system and hidden mounts.
+- Flat index format bumped to v2 so caches created before external-volume
+  support are invalidated and rebuilt automatically.
+- Added reproducible release packaging (bundled re2/abseil dylibs, DMG,
+  checksums) and a GitHub Actions tag-release workflow.
+
+Detailed change notes: docs/CHANGES_FROM_UPSTREAM.md
+
+Third-party components
+----------------------
+This app links against RE2 (BSD-3-Clause) and Abseil (Apache-2.0).
+See THIRD_PARTY_NOTICES.md and the licenses under third_party/.

@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v1.3.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: brew install re2 abseil
+
+      - name: Run fast test suite
+        run: make test-fast
+
+  build:
+    name: Build ${{ matrix.arch }} DMG
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x86_64
+            runner: macos-26-intel
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: brew install re2 abseil
+
+      - name: Build and package
+        run: |
+          ./scripts/package_release.sh \
+            --version "${{ steps.version.outputs.version }}" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Verify checksum
+        run: |
+          cd dist
+          shasum -a 256 -c ./*.sha256
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve version
+        id: version
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          cat > RELEASE_NOTES.md <<'EOF'
+          ## MacSoSo __VERSION__
+
+          Everything-compatible instant file search for macOS, adapted from
+          [joshua-wu/MacEverything](https://github.com/joshua-wu/MacEverything) (MIT).
+
+          ### Downloads
+
+          - `MacSoSo-__VERSION__-arm64.dmg` — Apple Silicon
+          - `MacSoSo-__VERSION__-x86_64.dmg` — Intel
+
+          Each DMG has a matching `.sha256` file. The app bundles its own
+          RE2/Abseil dylibs and runs on macOS 14 or later.
+
+          ### Install
+
+          1. Open the DMG for your architecture and drag MacSoSo to Applications.
+          2. Release builds are ad-hoc signed and not notarized. On first launch,
+             right-click the app and choose **Open**, or run:
+             `xattr -dr com.apple.quarantine /Applications/MacSoSo.app`
+          3. Grant **Full Disk Access** in System Settings when prompted.
+          4. Wait for the initial scan (it includes local volumes under `/Volumes`).
+
+          ### Changes
+
+          - Renamed the project and app from MacEverything to MacSoSo: new
+            bundle ID `com.macsoso.app`, binaries, cache/log paths, MCP key,
+            source tree and DMG names. Upstream attribution is preserved.
+            Existing MCP entries must be re-added under the new `macsoso` key.
+          - Search syntax and semantics aligned with voidtools Everything:
+            operators, quoting, wildcards, filters, functions, date filters,
+            duplicate/aggregate filters, and multi-column sorting.
+          - Everything-style four-column UI, persistent match-option toggles,
+            bottom status bar and complete result set.
+          - External local volumes under `/Volumes` are indexed again; the flat
+            index format was bumped to v2 to rebuild caches created before the fix.
+          - Reproducible release packaging: bundled RE2/Abseil, DMG, SHA256.
+
+          Full change notes:
+          https://github.com/__REPO__/blob/__TAG__/docs/CHANGES_FROM_UPSTREAM.md
+
+          Upstream attribution and third-party licenses are included in the
+          DMG and in the repository (`NOTICE`, `THIRD_PARTY_NOTICES.md`).
+          EOF
+          sed -i "s/__VERSION__/${VERSION}/g; s/__TAG__/${TAG}/g; s/__REPO__/${REPO}/g" RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          ls -lh dist
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MacSoSo $VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            dist/*.dmg dist/*.sha256
