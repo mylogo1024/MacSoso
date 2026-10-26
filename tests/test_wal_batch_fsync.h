@@ -144,6 +144,79 @@ static void runWalBatchFsyncBenchmark() {
         check(entries[1].record.size == 200, "WAL-Bench: updated size correct");
     }
 
+    // --- Contract: appends stay in the stdio buffer until drained ---
+    // The batched write path is what keeps a write() syscall off the index
+    // lock; these assertions pin down what the caller therefore owes the WAL:
+    // a batch is only durable once flushPending(), sync() or close() ran.
+    {
+        std::string walPath = tmpDir + "/bench_buffered.wal";
+        IndexWAL wal;
+        wal.open(walPath);
+        wal.setSyncInterval(0); // never auto-fsync
+
+        for (int i = 0; i < 8; i++) {
+            FileRecord rec;
+            rec.name = "buffered_" + std::to_string(i) + ".txt";
+            rec.path = "/test";
+            rec.type = 1;
+            wal.append(WALOp::Add, rec.path + "/" + rec.name, rec);
+        }
+
+        auto before = IndexWAL::readAll(walPath);
+        check(before.empty(), "WAL-Bench: buffered entries invisible before flush");
+
+        wal.flushPending();
+        auto after = IndexWAL::readAll(walPath);
+        check(after.size() == 8, "WAL-Bench: flushPending() makes buffered entries readable");
+        check(after[0].record.name == "buffered_0.txt", "WAL-Bench: flushed first entry correct");
+        check(after[7].record.name == "buffered_7.txt", "WAL-Bench: flushed last entry correct");
+
+        wal.close();
+    }
+
+    // --- Contract: sync() also drains the buffer (it used to fsync stale bytes) ---
+    {
+        std::string walPath = tmpDir + "/bench_sync_drains.wal";
+        IndexWAL wal;
+        wal.open(walPath);
+        wal.setSyncInterval(0);
+
+        for (int i = 0; i < 5; i++) {
+            FileRecord rec;
+            rec.name = "syncdrain_" + std::to_string(i) + ".txt";
+            rec.path = "/test";
+            rec.type = 1;
+            wal.append(WALOp::Add, rec.path + "/" + rec.name, rec);
+        }
+
+        wal.sync();
+        auto entries = IndexWAL::readAll(walPath);
+        check(entries.size() == 5, "WAL-Bench: sync() pushes buffered entries to the file");
+
+        wal.close();
+    }
+
+    // --- Contract: flushPending() is cheap when nothing is pending ---
+    {
+        std::string walPath = tmpDir + "/bench_flush_noop.wal";
+        IndexWAL wal;
+        wal.open(walPath);
+        wal.setSyncInterval(0);
+
+        FileRecord rec;
+        rec.name = "noop.txt";
+        rec.path = "/test";
+        rec.type = 1;
+        wal.append(WALOp::Add, "/test/noop.txt", rec);
+        wal.flushPending();
+        size_t sizeAfterFlush = wal.currentSize();
+        wal.flushPending(); // must not rewrite or grow anything
+        check(wal.currentSize() == sizeAfterFlush, "WAL-Bench: redundant flushPending() is a no-op");
+        check(IndexWAL::readAll(walPath).size() == 1, "WAL-Bench: no-op flush keeps one entry");
+
+        wal.close();
+    }
+
     fs::remove_all(tmpDir);
     std::cout << "\n";
 }

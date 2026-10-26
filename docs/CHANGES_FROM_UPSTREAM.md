@@ -185,3 +185,55 @@
 - 未采纳：基于 24 位 trigram 直接计数数组的两趟 CSR 构建（只影响启动峰值，
   需要重写 Phase 2 与压缩路径）；不同 key 数量级远小于预期（name 仅 8.0 万、
   path 仅 4.5 万个 trigram），所以「扁平 key 表 + 稠密 CSR」省不出多少内存。
+
+## 12. 搜索结果过多时不再卡死
+
+上游的写入与压缩路径在结果集很大时会把界面拖成分钟级无响应。2026-10-26 依据
+系统 microstackshot 定位后做了四处改动（详见 changelog 条目 154）：
+
+- `IndexWAL::append()` 不再每条 `fflush`，条目留在 stdio 缓冲里攒到
+  `syncInterval_` 才 `fflush` + `fsync`；新增 `flushPending()` 只把缓冲推给内核、
+  不做 `fsync`；`sync()` 与 `close()` 补上 `fsync` 之前的 `fflush`。
+- `batchMutate()`、`removeByPathPrefix()`、`batchRescanPrefix()` 在索引独占锁内
+  只做索引变更与 WAL 追加，出锁后统一 `flushPending()`——原来每条记录一次
+  `write()` 全排在锁里，把所有查询都堵在 FSEvents 写入方后面。
+- 压缩给搜索让路：`SearchEngine` 增加 `activeQueries_` 计数与 `hasActiveQuery()`
+  （`ActiveQueryGuard` 放在结果缓存查找之后，缓存命中不让压缩等待），
+  `IndexPersistence` 的定时器 tick 发现有查询在飞时延后 20 s 重试，最多 6 轮，
+  避免约 672 MiB 的快照深拷贝加 640 MB 底文件重写撞上用户搜索。
+- `IndexPersistence::flush()` 在「WAL 是唯一持久记录」的三个跳过分支显式
+  `flushPending()`；崩溃窗口内最多丢一个在途批次 / ≤8 KB，由启动时按
+  `lastEventId` 重放 FSEvents 兜底。
+- 前端单飞：`SearchViewModel` 的搜索收拢为 `performSearch → enqueueSearch →
+  startSearch`，索引刷新与输入产生的新请求在忙时只保留最新一条并在完成后回放，
+  不再叠加多份「10000 条结果 + 逐条转行对象」。实测 SwiftUI `Table` 本身
+  100→10000 行渲染耗时基本不变（46～50 ms），所以改动集中在锁与并发，而不是列表控件。
+- 回归：`tests/test_wal_batch_fsync.h` 固化了缓冲/排空契约，
+  `tests/test_fsevents_batch.h` 新增「不关 WAL 也能立刻读到批量变更条目」和
+  `hasActiveQuery()` 两项断言；`./test_all --fast` 与 `make test-asan` 均
+  12233 passed / 0 failed。
+
+## 13. 推送即自动构建并发布
+
+上游仓库没有发布流水线。本项目的 `.github/workflows/release.yml` 最初（条目 147、
+150）要求 Release 标签事先存在，`git push` 后 CI 直接报错退出。2026-10-26 改为
+「推 main 就发版」（详见 changelog 条目 155）：
+
+- `on.push` 同时监听 `branches: [main]` 与 `tags: ["v*"]`，另有
+  `workflow_dispatch.inputs.ref` 可指定分支 / 标签 / 提交。
+- 新增 `preflight` job 推导发布身份：分支推送时标签取自该提交
+  `MacSoSo/Info.plist` 的 `CFBundleShortVersionString`（即 `v$(plist_version)`），
+  因此**抬版本号就是发布开关**；同时校验 `vX.Y.Z` 格式，并把不合法版本号挡在
+  两台机器构建之前。
+- `should_publish` 门控：标签已存在且指向别的提交时只跑测试、不发布，并以
+  `::notice title=No release::` 提示需要 bump 版本；同版本号反复推 main 不会
+  覆盖已发布的 Release。
+- `test`（`make test-fast`）每次推送都跑；`build` 走 arm64 / x86_64 矩阵，
+  产物 `shasum -a 256 -c` 自检后经 `actions/upload-artifact@v4` 上传。
+- `publish` **先建标签再发布**：测试与两个 DMG 全部成功才 `git tag -a` 并推送，
+  构建失败不会留下指向坏提交的标签；已有标签指向别的提交时拒绝改指（不
+  `--force`）。发布用 `gh release view` 判存后走 `upload --clobber` + `edit`
+  或 `create`，所以 dispatch 重跑同一提交是幂等的。
+- 机器人自建标签不会再触发一次 workflow（GitHub 对 token 产生的事件不递归触发）。
+- 发布说明固定包含两个架构的 DMG 与 SHA256、ad-hoc 签名/未公证的首次启动提示、
+  Full Disk Access，以及改编自 [joshua-wu/MacEverything](https://github.com/joshua-wu/MacEverything) (MIT) 的署名。

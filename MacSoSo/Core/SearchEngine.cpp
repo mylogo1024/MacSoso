@@ -511,92 +511,100 @@ bool SearchEngine::removeByPath(const std::string& fullPath) {
 }
 
 uint32_t SearchEngine::removeByPathPrefix(const std::string& pathPrefix) {
-    std::unique_lock lock(mutex_);
-    invalidateQueryCache();   // bulk prefix removal changes query answers
-
-    std::string lowerPrefix = me::toLower(pathPrefix);
-    const std::vector<uint32_t> matched = collectSubtreeRecordsUnlocked(lowerPrefix);
-    removeRecordsFromIndexesBatch(matched);
+    std::shared_ptr<IndexWAL> wal;
     uint32_t removed = 0;
-    for (uint32_t idx : matched) {
-        if (idx >= types_.size() || types_[idx] == 0) continue;
+    {
+        std::unique_lock lock(mutex_);
+        invalidateQueryCache();   // bulk prefix removal changes query answers
 
-        // H-4: Write WAL entry for each removed path
-        if (wal_) {
-            std::string fullPath = makeFullPath(pathPool_.str(pathIndices_[idx]), origNamePool_.str(idx));
-            wal_->append(WALOp::Remove, fullPath);
+        std::string lowerPrefix = me::toLower(pathPrefix);
+        const std::vector<uint32_t> matched = collectSubtreeRecordsUnlocked(lowerPrefix);
+        removeRecordsFromIndexesBatch(matched);
+        for (uint32_t idx : matched) {
+            if (idx >= types_.size() || types_[idx] == 0) continue;
+
+            // H-4: Write WAL entry for each removed path
+            if (wal_) {
+                std::string fullPath = makeFullPath(pathPool_.str(pathIndices_[idx]), origNamePool_.str(idx));
+                wal_->append(WALOp::Remove, fullPath);
+            }
+
+            time_t oldModTime = static_cast<time_t>(modTimes_[idx]);
+            unindexRecordByIdxUnlocked(idx);
+            tombstoneAt(idx);
+            liveCount_.fetch_sub(1, std::memory_order_relaxed);
+            removeFromRecentCache(idx, oldModTime);
+            removed++;
         }
-
-        time_t oldModTime = static_cast<time_t>(modTimes_[idx]);
-        unindexRecordByIdxUnlocked(idx);
-        tombstoneAt(idx);
-        liveCount_.fetch_sub(1, std::memory_order_relaxed);
-        removeFromRecentCache(idx, oldModTime);
-        removed++;
+        wal = wal_;
     }
-
+    if (wal) wal->flushPending();
     return removed;
 }
 
 uint32_t SearchEngine::batchRescanPrefix(const std::string& pathPrefix,
                                          std::vector<FileRecord>&& freshRecords) {
-    std::unique_lock lock(mutex_);
-
-    // ── Phase 1: Tombstone old records matching prefix ──
-    // Postings are filtered in one pass over the affected lists, then each
-    // record is unindexed and tombstoned.
-    std::string lowerPrefix = me::toLower(pathPrefix);
-    const std::vector<uint32_t> stale = collectSubtreeRecordsUnlocked(lowerPrefix);
-    removeRecordsFromIndexesBatch(stale);
+    std::shared_ptr<IndexWAL> wal;
     uint32_t removed = 0;
-    for (uint32_t idx : stale) {
-        if (idx >= types_.size() || types_[idx] == 0) continue;
+    {
+        std::unique_lock lock(mutex_);
 
-        // Write WAL Remove entry for each removed path
-        if (wal_) {
-            std::string fullPath = makeFullPath(pathPool_.str(pathIndices_[idx]), origNamePool_.str(idx));
-            wal_->append(WALOp::Remove, fullPath);
+        // ── Phase 1: Tombstone old records matching prefix ──
+        // Postings are filtered in one pass over the affected lists, then each
+        // record is unindexed and tombstoned.
+        std::string lowerPrefix = me::toLower(pathPrefix);
+        const std::vector<uint32_t> stale = collectSubtreeRecordsUnlocked(lowerPrefix);
+        removeRecordsFromIndexesBatch(stale);
+        for (uint32_t idx : stale) {
+            if (idx >= types_.size() || types_[idx] == 0) continue;
+
+            // Write WAL Remove entry for each removed path
+            if (wal_) {
+                std::string fullPath = makeFullPath(pathPool_.str(pathIndices_[idx]), origNamePool_.str(idx));
+                wal_->append(WALOp::Remove, fullPath);
+            }
+
+            unindexRecordByIdxUnlocked(idx);
+            tombstoneAt(idx);
+            liveCount_.fetch_sub(1, std::memory_order_relaxed);
+            removed++;
         }
 
-        unindexRecordByIdxUnlocked(idx);
-        tombstoneAt(idx);
-        liveCount_.fetch_sub(1, std::memory_order_relaxed);
-        removed++;
+        // ── Phase 2: Add fresh records with incremental trigram insertion ──
+        for (auto& record : freshRecords) {
+            uint32_t newIdx = static_cast<uint32_t>(types_.size());
+            std::string fullPath = makeFullPath(record.path, record.name);
+            std::string lower = me::toLower(record.name);
+
+            if (wal_) wal_->append(WALOp::Update, fullPath, record);
+
+            uint32_t pIdx = internPath(record.path);
+            if (pIdx >= pathIdxToRecords_.size()) {
+                ensurePathTrigramsForPathIdx(pIdx);
+            }
+            record.path.clear();
+            record.path.shrink_to_fit();
+
+            origNamePool_.append(record.name);
+            pushRecord(std::move(record));
+            namePool_.append(lower);
+            pathIndices_.push_back(pIdx);
+            indexRecordByIdxUnlocked(newIdx);
+            addTrigramsForRecord(newIdx, namePool_.data(newIdx), namePool_.length(newIdx));
+            addPathTrigramsForRecord(newIdx);
+            addExtensionForRecord(newIdx);
+            if (newIdx / kRecordsPerPage >= dirtyPages_.size()) {
+                dirtyPages_.resize(newIdx / kRecordsPerPage + 1, false);
+            }
+            markPageDirty(newIdx);
+            liveCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ── Phase 3: Rebuild recent cache ──
+        rebuildRecentCache();
+        wal = wal_;
     }
-
-    // ── Phase 2: Add fresh records with incremental trigram insertion ──
-    for (auto& record : freshRecords) {
-        uint32_t newIdx = static_cast<uint32_t>(types_.size());
-        std::string fullPath = makeFullPath(record.path, record.name);
-        std::string lower = me::toLower(record.name);
-
-        if (wal_) wal_->append(WALOp::Update, fullPath, record);
-
-        uint32_t pIdx = internPath(record.path);
-        if (pIdx >= pathIdxToRecords_.size()) {
-            ensurePathTrigramsForPathIdx(pIdx);
-        }
-        record.path.clear();
-        record.path.shrink_to_fit();
-
-        origNamePool_.append(record.name);
-        pushRecord(std::move(record));
-        namePool_.append(lower);
-        pathIndices_.push_back(pIdx);
-        indexRecordByIdxUnlocked(newIdx);
-        addTrigramsForRecord(newIdx, namePool_.data(newIdx), namePool_.length(newIdx));
-        addPathTrigramsForRecord(newIdx);
-        addExtensionForRecord(newIdx);
-        if (newIdx / kRecordsPerPage >= dirtyPages_.size()) {
-            dirtyPages_.resize(newIdx / kRecordsPerPage + 1, false);
-        }
-        markPageDirty(newIdx);
-        liveCount_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // ── Phase 3: Rebuild recent cache ──
-    rebuildRecentCache();
-
+    if (wal) wal->flushPending();
     return removed;
 }
 
@@ -654,15 +662,23 @@ void SearchEngine::updateByPath(const std::string& fullPath, FileRecord&& update
 
 void SearchEngine::batchMutate(std::vector<MutationOp>&& ops) {
     if (ops.empty()) return;
-    std::unique_lock lock(mutex_);
-    invalidateQueryCache();   // any index change invalidates cached answers
-    for (auto& op : ops) {
-        if (op.type == MutationOp::REMOVE) {
-            removeByPathUnlocked(op.path);
-        } else {
-            updateByPathUnlocked(op.path, std::move(op.record));
+    std::shared_ptr<IndexWAL> wal;
+    {
+        std::unique_lock lock(mutex_);
+        invalidateQueryCache();   // any index change invalidates cached answers
+        for (auto& op : ops) {
+            if (op.type == MutationOp::REMOVE) {
+                removeByPathUnlocked(op.path);
+            } else {
+                updateByPathUnlocked(op.path, std::move(op.record));
+            }
         }
+        wal = wal_;
     }
+    // Durability is handed back to the WAL once the batch is done, outside the
+    // index lock: a write() syscall per record here stalled every query behind
+    // the FSEvents writer.
+    if (wal) wal->flushPending();
 }
 
 std::unordered_map<uint32_t, uint32_t> SearchEngine::compactRecords() {

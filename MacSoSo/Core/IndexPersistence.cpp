@@ -132,11 +132,15 @@ void IndexPersistence::flush(const IndexMetadata& metadata, bool force) {
         } else {
             if (!wal_->isDirty()) {
                 LOG_INFO("IndexPersistence", "Skipping flush — no mutations since last flush");
+                wal_->flushPending();
                 return;
             }
             if (wal_->entryCount() < kCompactThreshold) {
                 LOG_INFO("IndexPersistence", "Skipping flush — only "
                           << wal_->entryCount() << " entries (threshold=" << kCompactThreshold << ")");
+                // The WAL is the only durable record of these mutations, so its
+                // buffered entries must reach the file before we return.
+                wal_->flushPending();
                 return;
             }
         }
@@ -171,6 +175,9 @@ void IndexPersistence::flush(const IndexMetadata& metadata, bool force) {
         LOG_INFO("IndexPersistence", "Skipping base fold — WAL=" << walSize
                   << "B <= threshold " << kWALFoldSizeThreshold
                   << "B (incremental WAL only)");
+        // No base rewrite, so the WAL alone must hold every buffered entry.
+        std::lock_guard<std::mutex> lock(walMutex_);
+        if (wal_) wal_->flushPending();
         return;
     }
 
@@ -353,6 +360,21 @@ void IndexPersistence::startAutoCompaction(double intervalSec, std::shared_ptr<F
 
     auto* self = this;
     dispatch_source_set_event_handler(timer_, ^{
+        // Never fold the base file or shrink the pools while a search is running:
+        // the rewrite snapshots ~0.7 GB of pools under the index lock and then
+        // writes the whole file, which is the stall a user feels mid-search.
+        // After a few deferrals the work runs anyway, so a chatty client cannot
+        // starve durability or capacity reclamation.
+        if (self->engine_ && self->engine_->hasActiveQuery() &&
+            self->deferredTicks_ < kMaxDeferredTicks) {
+            self->deferredTicks_++;
+            LOG_INFO("IndexPersistence", "Tick deferred — query in flight ("
+                      << self->deferredTicks_ << "/" << kMaxDeferredTicks << ")");
+            self->rescheduleTimer(kQueryBusyRetrySec);
+            return;
+        }
+        self->deferredTicks_ = 0;
+
         uint64_t eventId = watcher ? watcher->getLastEventId() : 0;
         self->flush(eventId);
         // Incremental updates grow the SoA columns and string pools by doubling;

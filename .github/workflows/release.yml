@@ -1,14 +1,19 @@
 name: Release
 
+# A push to `main` is enough to ship: the release tag is derived from
+# MacSoSo/Info.plist and created by CI once the tests and both DMG builds pass.
+# Pushing a `v*` tag directly still works and publishes that tag as-is.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing tag to build and publish (for example v1.0.0)"
-        required: true
+      ref:
+        description: "Branch, tag or commit to build and publish (defaults to the selected ref)"
+        required: false
         type: string
 
 concurrency:
@@ -24,33 +29,107 @@ env:
 
 jobs:
   preflight:
-    name: Validate release tag
+    name: Resolve release version
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+      tag_exists: ${{ steps.release.outputs.tag_exists }}
+      tag_sha: ${{ steps.release.outputs.tag_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Resolve and validate tag
-        id: version
+      - name: Resolve tag, version and whether to publish
+        id: release
         env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          PUSH_REF: ${{ github.ref }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
         shell: bash
         run: |
+          set -euo pipefail
+
+          plist_version() {
+            git show "$1:MacSoSo/Info.plist" |
+              python3 -c 'import plistlib,sys; sys.stdout.write(plistlib.loads(sys.stdin.buffer.read())["CFBundleShortVersionString"])'
+          }
+
+          resolve_commit() {
+            local r="$1"
+            if [[ "$r" =~ ^[0-9a-fA-F]{7,40}$ ]] && git rev-parse -q --verify "${r}^{commit}" >/dev/null; then
+              git rev-parse "${r}^{commit}"; return
+            fi
+            for cand in "refs/tags/$r" "refs/remotes/origin/$r" "$r"; do
+              if git rev-parse -q --verify "${cand}^{commit}" >/dev/null; then
+                git rev-parse "${cand}^{commit}"; return
+              fi
+            done
+            echo "Could not resolve '$r' to a commit. Pass a branch, tag or pushed commit SHA." >&2
+            exit 1
+          }
+
+          # 1. Which commit are we releasing? CI checkouts already sit on the
+          #    pushed ref; only a manual dispatch can name a different one.
+          if [[ "$EVENT" == "workflow_dispatch" && -n "${INPUT_REF:-}" ]]; then
+            SHA="$(resolve_commit "$INPUT_REF")"
+          else
+            SHA="$(git rev-parse 'HEAD^{commit}')"
+          fi
+
+          # 2. Which tag does it ship under?
+          #    An explicit tag push wins; a branch push derives the tag from the
+          #    plist, so bumping CFBundleShortVersionString is the release switch.
+          TAG=""
+          VERSION=""
+          if [[ "$EVENT" == "push" && "$PUSH_REF" == refs/tags/* ]]; then
+            TAG="${PUSH_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          elif [[ "$EVENT" == "workflow_dispatch" && -n "${INPUT_REF:-}" && "${INPUT_REF}" =~ ^v[0-9] ]]; then
+            TAG="$INPUT_REF"
+            VERSION="${TAG#v}"
+          else
+            VERSION="$(plist_version "$SHA")"
+            TAG="v$VERSION"
+          fi
+
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Tag must look like v1.2.3 (got: $TAG)" >&2
+            echo "Refusing to release: '$TAG' is not vX.Y.Z (plist version: $VERSION)" >&2
             exit 1
           fi
-          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "Release tag '$TAG' does not exist in origin. Create and push it first:" >&2
-            echo "  git tag -a $TAG -m \"MacSoSo ${TAG#v}\" && git push origin $TAG" >&2
-            exit 1
+
+          # 3. Publish, or tests only? A branch push whose tag already exists on
+          #    another commit means the plist version wasn't bumped, so we build
+          #    nothing and leave the published release alone.
+          SHOULD_PUBLISH=yes
+          TAG_EXISTS=no
+          TAG_SHA=""
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAG_EXISTS=yes
+            TAG_SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [[ "$SHA" != "$TAG_SHA" && "$EVENT" != "workflow_dispatch" ]]; then
+              SHOULD_PUBLISH=no
+              echo "::notice title=No release::Tag $TAG already points at ${TAG_SHA:0:7}, not ${SHA:0:7}."
+              echo "This commit does not bump CFBundleShortVersionString, so tests ran but nothing was published."
+              echo "To ship it, raise MacSoSo/Info.plist -> CFBundleShortVersionString and push again."
+            fi
+          else
+            echo "Tag $TAG does not exist yet; CI will create and push it once tests and builds pass."
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "should_publish=$SHOULD_PUBLISH"
+            echo "tag_exists=$TAG_EXISTS"
+            echo "tag_sha=$TAG_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "sha=$SHA tag=$TAG version=$VERSION should_publish=$SHOULD_PUBLISH tag_exists=$TAG_EXISTS"
 
   test:
     name: Unit tests
@@ -59,7 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
 
       - name: Install dependencies
@@ -71,6 +150,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} DMG
     needs: [preflight, test]
+    if: needs.preflight.outputs.should_publish == 'yes'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -84,7 +164,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
 
       - name: Install dependencies
@@ -112,13 +192,38 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [preflight, build]
+    needs: [preflight, test, build]
+    if: needs.preflight.outputs.should_publish == 'yes'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ needs.preflight.outputs.tag }}
+          ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
+
+      - name: Create and push the release tag
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAG_EXISTS: ${{ needs.preflight.outputs.tag_exists }}
+          TAG_SHA: ${{ needs.preflight.outputs.tag_sha }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$TAG_EXISTS" == "yes" ]]; then
+            if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$SHA" ]]; then
+              echo "Tag $TAG already points at $TAG_SHA, not $SHA." >&2
+              echo "Refusing to repoint an existing tag; bump CFBundleShortVersionString instead." >&2
+              exit 1
+            fi
+            echo "Tag $TAG already points at this commit; re-publishing its assets."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "MacSoSo $VERSION" "$SHA"
+          git push origin "refs/tags/$TAG"
 
       - name: Download release assets
         uses: actions/download-artifact@v4
@@ -170,6 +275,8 @@ jobs:
             bottom status bar and complete result set.
           - External local volumes under `/Volumes` are indexed again; the flat
             index format was bumped to v2 to rebuild caches created before the fix.
+          - Inverted-index postings compacted into a delta+varint arena, which
+            cuts the resident index by roughly a third.
           - Reproducible release packaging: bundled RE2/Abseil, DMG, SHA256.
 
           Full change notes:
@@ -188,10 +295,18 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         shell: bash
         run: |
+          set -euo pipefail
           ls -lh dist
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "MacSoSo $VERSION" \
-            --notes-file RELEASE_NOTES.md \
-            --verify-tag \
-            dist/*.dmg dist/*.sha256
+          # The tag is guaranteed to point at this commit by the step above.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.dmg dist/*.sha256 \
+              --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "MacSoSo $VERSION" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "MacSoSo $VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              dist/*.dmg dist/*.sha256
+          fi

@@ -76,6 +76,12 @@ public:
     static constexpr size_t kWALFoldSizeThreshold = 16 * 1024 * 1024; // 16MB
     static constexpr double kTombstoneCompactRatio = 0.25;
     static constexpr double kDeadSpaceRewriteRatio = 0.5;
+    /// When a tick finds a query in flight it re-arms after this delay instead
+    /// of starting the heavy snapshot+rewrite on top of the search.
+    static constexpr double kQueryBusyRetrySec = 20.0;
+    /// ... and stops deferring after this many retries, so a busy client cannot
+    /// starve durability or capacity reclamation forever.
+    static constexpr int kMaxDeferredTicks = 6;
 
 private:
     std::shared_ptr<SearchEngine> engine_;
@@ -90,6 +96,8 @@ private:
     dispatch_source_t timer_ = nullptr;
     dispatch_queue_t  timerQueue_ = nullptr;
     double currentIntervalSec_ = 0;
+    /// Consecutive ticks skipped because a query was in flight (timer queue only).
+    int deferredTicks_ = 0;
     mutable std::mutex walMutex_;
 
     /// Compute the next auto-compaction interval based on dirty ratio and WAL size.

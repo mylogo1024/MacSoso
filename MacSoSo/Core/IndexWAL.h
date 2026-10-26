@@ -31,8 +31,14 @@ public:
     bool open(const std::string& walPath);
 
     /// Append a mutation entry. Thread-safe.
-    /// Data is flushed to OS buffers but fsync is deferred (batched).
+    /// Entries land in the stdio buffer; nothing reaches the file until the
+    /// buffer fills, `flushPending()` runs, or the fsync interval is reached.
     bool append(WALOp op, const std::string& fullPath, const FileRecord& record = {});
+
+    /// Push buffered entries into the kernel without fsync. Batch mutation
+    /// callers call this once at the end of a batch so that a write() syscall
+    /// does not have to be paid per record while the index lock is held.
+    void flushPending();
 
     /// Force fsync to disk. Call when you need durability guarantees.
     void sync();

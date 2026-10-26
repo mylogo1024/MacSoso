@@ -175,6 +175,20 @@ static PreprocessedQuery preprocessQuery(const std::string& raw) {
 // Main query() entry points
 // ---------------------------------------------------------------------------
 
+/// Counts queries that are actively walking the index, so that background
+/// persistence can defer a heavy base rewrite instead of competing with them.
+namespace {
+struct ActiveQueryGuard {
+    std::atomic<uint32_t>& counter;
+    explicit ActiveQueryGuard(std::atomic<uint32_t>& c) : counter(c) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~ActiveQueryGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    ActiveQueryGuard(const ActiveQueryGuard&) = delete;
+    ActiveQueryGuard& operator=(const ActiveQueryGuard&) = delete;
+};
+} // namespace
+
 std::vector<uint32_t> SearchEngine::query(const std::string& keyword, uint32_t maxResults,
                                           bool useTrigram, uint64_t sessionId) const {
     QueryTimingInfo unused;
@@ -216,6 +230,7 @@ std::vector<uint32_t> SearchEngine::query(const std::string& keyword, uint32_t m
     // All queries go through the unified Advanced path. Everything has no
     // directory-listing operator: a slash term is matched against the full
     // path like any other term.
+    ActiveQueryGuard active(activeQueries_);
     std::vector<uint32_t> result;
     bool completed = true;
     result = queryAdvanced(pq.original, maxResults, useTrigram, timing, myGen, genAtom.get());

@@ -167,18 +167,32 @@ bool IndexWAL::append(WALOp op, const std::string& fullPath, const FileRecord& r
 
     currentSize_ += buf.size() + sizeof(uint32_t);
 
-    fflush(file_);
     entryCount_++;
     unflushedCount_++;
     dirty_.store(true, std::memory_order_relaxed);
 
-    // Batch fsync: only fsync every syncInterval_ entries
+    // Batch fsync: only fsync every syncInterval_ entries. The fflush that
+    // precedes it is what makes the fsync cover these entries; ordinary
+    // appends stay in the stdio buffer until the buffer fills, the interval
+    // fires, or the caller drains the batch with flushPending().
     if (syncInterval_ > 0 && unflushedCount_ >= syncInterval_) {
+        fflush(file_);
         fsync(fileno(file_));
         unflushedCount_ = 0;
     }
 
     return true;
+}
+
+void IndexWAL::flushPending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!file_) return;
+    if (unflushedCount_ == 0) return;
+    fflush(file_);
+    if (syncInterval_ > 0 && unflushedCount_ >= syncInterval_) {
+        fsync(fileno(file_));
+        unflushedCount_ = 0;
+    }
 }
 
 std::vector<WALEntry> IndexWAL::readAll(const std::string& walPath) {
@@ -251,6 +265,7 @@ std::vector<WALEntry> IndexWAL::readAll(const std::string& walPath) {
 void IndexWAL::sync() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (file_ && unflushedCount_ > 0) {
+        fflush(file_);
         fsync(fileno(file_));
         unflushedCount_ = 0;
     }
@@ -260,6 +275,7 @@ void IndexWAL::close() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (file_) {
         if (unflushedCount_ > 0) {
+            fflush(file_);
             fsync(fileno(file_));
             unflushedCount_ = 0;
         }

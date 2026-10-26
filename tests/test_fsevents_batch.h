@@ -234,5 +234,131 @@ static void runFSEventsBatchTests() {
         std::remove(walPath.c_str());
     }
 
+    // ── Test 7: batch mutations drain the WAL themselves ──
+    // The batch paths append under the index lock but must not fflush per
+    // record; they call IndexWAL::flushPending() after releasing it. Without
+    // that drain a crash-recovery reader would see a WAL that lags the index.
+    {
+        std::cout << "\n  Test 7: batch mutations leave the WAL readable while still open\n";
+        std::string walPath = "/tmp/test_batch_drain_wal_" + std::to_string(getpid()) + ".wal";
+
+        SearchEngine engine;
+        auto wal = std::make_shared<IndexWAL>();
+        wal->open(walPath);
+        wal->setSyncInterval(100000); // no automatic fsync/flush within this batch
+        engine.attachWAL(wal);
+
+        std::vector<SearchEngine::MutationOp> ops;
+        for (int i = 0; i < 30; i++) {
+            FileRecord r;
+            r.name = "drain_" + std::to_string(i) + ".txt";
+            r.path = "/drain";
+            r.type = 1;
+            r.size = i;
+            r.modTime = 100 + i;
+            ops.push_back({SearchEngine::MutationOp::UPDATE, r.path + "/" + r.name, std::move(r)});
+        }
+        engine.batchMutate(std::move(ops));
+        check(IndexWAL::readAll(walPath).size() == 30,
+              "batchMutate() flushed 30 WAL entries without an explicit sync");
+
+        engine.removeByPathPrefix("/drain");
+        check(IndexWAL::readAll(walPath).size() == 60,
+              "removeByPathPrefix() flushed its WAL entries without an explicit sync");
+
+        std::vector<FileRecord> seed;
+        for (int i = 0; i < 10; i++) {
+            FileRecord r;
+            r.name = "stale_" + std::to_string(i) + ".txt";
+            r.path = "/rescan";
+            r.type = 1;
+            r.size = i;
+            r.modTime = 100 + i;
+            seed.push_back(std::move(r));
+        }
+        std::vector<SearchEngine::MutationOp> seedOps;
+        for (auto& r : seed) {
+            std::string full = r.path + "/" + r.name;
+            seedOps.push_back({SearchEngine::MutationOp::UPDATE, full, std::move(r)});
+        }
+        engine.batchMutate(std::move(seedOps));
+
+        std::vector<FileRecord> fresh;
+        for (int i = 0; i < 5; i++) {
+            FileRecord r;
+            r.name = "rescan_" + std::to_string(i) + ".txt";
+            r.path = "/rescan";
+            r.type = 1;
+            r.size = i;
+            r.modTime = 200 + i;
+            fresh.push_back(std::move(r));
+        }
+        engine.batchRescanPrefix("/rescan", std::move(fresh));
+        auto entries = IndexWAL::readAll(walPath);
+        // 30 adds + 30 removes + 10 seeds + 10 stale removes + 5 fresh adds
+        check(entries.size() == 30 + 30 + 10 + 10 + 5,
+              "batchRescanPrefix() flushed remove + add entries without an explicit sync");
+        check(entries.back().op == WALOp::Update && entries.back().record.name == "rescan_4.txt",
+              "batchRescanPrefix() last WAL entry is the final fresh record");
+
+        engine.detachWAL();
+        wal->close();
+        std::remove(walPath.c_str());
+    }
+
+    // ── Test 8: hasActiveQuery() tracks in-flight index walks ──
+    // IndexPersistence defers compaction while this is true, so a 640 MB
+    // base rewrite cannot land on top of a user search.
+    {
+        std::cout << "\n  Test 8: hasActiveQuery() reflects running queries\n";
+
+        SearchEngine engine;
+        check(!engine.hasActiveQuery(), "no active query before any search");
+
+        for (int i = 0; i < 20000; i++) {
+            FileRecord r;
+            r.name = "probe_target_" + std::to_string(i) + ".dat";
+            r.path = "/probe/sub" + std::to_string(i % 97);
+            r.type = 1;
+            r.size = i;
+            r.modTime = i;
+            engine.addRecord(std::move(r));
+        }
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> rounds{0};
+        std::vector<std::thread> workers;
+        workers.reserve(4);
+        for (int t = 0; t < 4; t++) {
+            workers.emplace_back([&, t] {
+                uint64_t k = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    // Unique keyword per call: a cache hit returns before the
+                    // in-flight counter is bumped, so it would not exercise it.
+                    engine.query("probe_target_" + std::to_string(k + t * 1000000ULL), 50);
+                    k++;
+                    rounds.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        // Workers run until both signals are observed, so neither assertion
+        // depends on how long a single query happens to take on this machine.
+        bool sawActive = false;
+        while ((!sawActive || rounds.load() < 4) &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (engine.hasActiveQuery()) sawActive = true;
+            else std::this_thread::yield();
+        }
+        check(sawActive, "hasActiveQuery() is true while queries are running");
+
+        stop.store(true);
+        for (auto& th : workers) th.join();
+        check(!engine.hasActiveQuery(), "hasActiveQuery() is false once all queries finished");
+        check(rounds.load() >= 4, "all query workers completed at least one index walk");
+        std::cout << "    (query rounds: " << rounds.load() << ")\n";
+    }
+
     std::cout << "\n";
 }

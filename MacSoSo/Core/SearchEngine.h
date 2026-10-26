@@ -279,6 +279,11 @@ public:
     /// Number of live (non-tombstoned) records.
     uint32_t liveRecordCount() const { return liveCount_.load(std::memory_order_relaxed); }
 
+    /// True while a query is walking the index. Persistence uses it to avoid
+    /// starting a full base rewrite (pool snapshot + hundreds of MB of writes)
+    /// in the middle of a search, which is what the user feels as a freeze.
+    bool hasActiveQuery() const { return activeQueries_.load(std::memory_order_relaxed) > 0; }
+
     /// Compact in-memory records by removing tombstoned entries.
     /// Rebuilds pathIndex_ and namePool_. Thread-safe.
     /// Returns a mapping from old index → new index for live records.
@@ -447,6 +452,7 @@ private:
     PathIndexTable lowerPathLookup_;  // lowered path hash -> pathPool_ index
     PathIndexTable pathIndex_;      // lowercase full path hash -> record index
     std::atomic<uint32_t> liveCount_{0};
+    mutable std::atomic<uint32_t> activeQueries_{0};
     mutable std::shared_mutex mutex_;
 
     // Rendered-result LRU cache (the "index cache" for query answers).

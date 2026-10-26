@@ -61,6 +61,13 @@ class SearchViewModel: ObservableObject {
     private var searchGeneration: UInt64 = 0
     private static let guiSessionId: UInt64 = 1
 
+    /// Single-flight gate for name searches: only one engine query plus its
+    /// row conversion may be in flight. Index refreshes that arrive while the
+    /// bus is busy are collapsed into the newest request and replayed when it
+    /// drains — stacking them is what beachballed large result sets.
+    private var searchInFlight = false
+    private var deferredSearch: (query: String, generation: UInt64)?
+
     private static let maxResults: UInt32 = 10000
     private static let indexChangeThrottleNs: UInt64 = 5_000_000_000 // 5 seconds
 
@@ -284,10 +291,25 @@ class SearchViewModel: ObservableObject {
     }
 
     private func performSearch(_ keyword: String) {
+        enqueueSearch(searchOptions.buildQuery(keyword))
+    }
+
+    /// Queue a name search, or start it immediately when no other query is
+    /// still running. A newer request replaces an older deferred one — the
+    /// list only ever needs the latest answer.
+    private func enqueueSearch(_ query: String) {
+        let gen = searchGeneration
+        if searchInFlight {
+            deferredSearch = (query: query, generation: gen)
+            return
+        }
+        startSearch(query, generation: gen)
+    }
+
+    private func startSearch(_ query: String, generation gen: UInt64) {
+        searchInFlight = true
         let bridge = self.bridge
         let maxResults = Self.maxResults
-        let gen = searchGeneration
-        let query = searchOptions.buildQuery(keyword)
         Task.detached { [weak self] in
             let start = CFAbsoluteTimeGetCurrent()
             // P-4: Use batch method — single engine lock, no NSNumber boxing
@@ -308,15 +330,31 @@ class SearchViewModel: ObservableObject {
             }
 
             await MainActor.run { [weak self] in
-                guard let self, self.searchGeneration == gen else { return }
+                guard let self else { return }
+                self.searchInFlight = false
+                guard self.searchGeneration == gen else {
+                    self.drainDeferredSearch()
+                    return
+                }
                 self.highlightHints = query.isEmpty
                     ? []
                     : self.bridge.parseHighlightHints(query).map { HighlightHint(from: $0) }
                 self.displayItems = items
                 self.totalMatches = totalCount
                 self.queryTimeMs = elapsed
+                self.drainDeferredSearch()
             }
         }
+    }
+
+    /// Replay the newest request that arrived while the bus was busy. Requests
+    /// from a superseded generation are dropped: the debounce for the current
+    /// generation calls `enqueueSearch` again, and by then the bus is free.
+    private func drainDeferredSearch() {
+        guard !searchInFlight, let pending = deferredSearch else { return }
+        deferredSearch = nil
+        guard pending.generation == searchGeneration else { return }
+        startSearch(pending.query, generation: pending.generation)
     }
 
     private func performContentSearch(_ keyword: String) {

@@ -158,19 +158,21 @@
 | [151](151-app-icon-magnifier.md) | chore | 更换为橙色放大镜应用图标 | 2026-10-26 |
 | [152](152-idle-memory-and-bulk-rescan.md) | performance | 后台常驻内存压缩与批量重扫提速 | 2026-10-26 |
 | [153](153-posting-index-varint-arena.md) | performance | 倒排链改为单块 arena 的 delta + varint 压缩存储 | 2026-10-26 |
+| [154](154-search-freeze-wal-flush-and-compaction-deferral.md) | bugfix | 搜索结果过多时界面卡死的四处修复 | 2026-10-26 |
+| [155](155-push-to-publish-release-workflow.md) | chore | 推送到 main 即自动构建并发布 Release | 2026-10-26 |
 
 ## 统计
 
 | 类型 | 数量 |
 |------|------|
-| bugfix | 51 |
+| bugfix | 52 |
 | feature | 34 |
 | performance | 33 |
 | refactor | 17 |
 | test | 5 |
 | docs | 2 |
-| chore | 5 |
-| **合计** | **147 条 (140 个编号, 7 组重复编号各 2 条)** |
+| chore | 6 |
+| **合计** | **149 条 (142 个编号, 7 组重复编号各 2 条)** |
 
 ---
 
@@ -183,4 +185,4 @@
 | 2026-04-18 | 22 |
 | 2026-04-19 | 38 |
 | 2026-10-23 | 4 |
-| 2026-10-26 | 4 |
+| 2026-10-26 | 6 |
