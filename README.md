@@ -23,7 +23,7 @@
 ---
 
 <p align="center">
-  <img src="assets/screen-shot.jpg" alt="MacSoSo Screenshot" width="720" /><br/>
+  <img src="assets/screen-shot.png" alt="MacSoSo Screenshot" width="720" /><br/>
   <sub>界面截图摄于更名前；当前版本窗口标题已改为 MacSoSo。</sub>
 </p>
 

@@ -23,7 +23,7 @@
 ---
 
 <p align="center">
-  <img src="assets/screen-shot.jpg" alt="MacSoSo Screenshot" width="720" /><br/>
+  <img src="assets/screen-shot.png" alt="MacSoSo Screenshot" width="720" /><br/>
   <sub>Screenshot from the pre-rename build; the current window title is MacSoSo.</sub>
 </p>
 
