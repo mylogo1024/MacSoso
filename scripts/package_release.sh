@@ -297,7 +297,14 @@ for helper in "$APP/Contents/MacOS"/*; do
     codesign "${SIGN_ARGS[@]}" "$helper"
 done
 
-codesign "${SIGN_ARGS[@]}" \
+# Sign the bundle itself. Use --deep so codesign recursively signs every
+# nested Mach-O (Frameworks dylibs, Contents/MacOS helpers like MacSoSoMCP,
+# XPC services, plug-ins) with the same identity. This is the canonical fix
+# for "code object is not signed at all / In subcomponent: …" — it makes the
+# bundle signature self-sufficient instead of relying solely on the manual
+# nested-signing loops above, and also applies the hardened runtime to all
+# nested code when using a Developer ID identity.
+codesign "${SIGN_ARGS[@]}" --deep \
     --entitlements "$ROOT/MacSoSo/MacSoSo.entitlements" \
     "$APP"
 codesign --verify --deep --strict "$APP"
