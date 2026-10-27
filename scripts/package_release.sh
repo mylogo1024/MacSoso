@@ -131,8 +131,8 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
         -derivedDataPath "$BUILD_DIR" \
         ARCHS="$ARCH" \
         ONLY_ACTIVE_ARCH=NO \
-        CODE_SIGNING_ALLOWED=NO \
-        CODE_SIGNING_REQUIRED=NO \
+        CODE_SIGN_IDENTITY="-" \
+        CODE_SIGNING_REQUIRED=YES \
         RE2_PREFIX="$RE2_PREFIX" \
         ABSEIL_PREFIX="$ABSEIL_PREFIX" \
         build
@@ -290,21 +290,27 @@ done
 # Contents/MacOS (Xcode's "Copy Files" phase drops helpers like MacSoSoMCP
 # there unsigned). If any nested Mach-O is left unsigned, the bundle sign
 # below fails with "code object is not signed at all In subcomponent".
-for helper in "$APP/Contents/MacOS"/*; do
-    [[ -f "$helper" && -x "$helper" ]] || continue
+# Scan every file under Contents/MacOS and sign it, skipping only the main
+# executable. We intentionally do NOT test for the executable bit (-x): the
+# "Copy Files" build phase can drop +x on the nested CLI tool (MacSoSoMCP),
+# and a missing +x would let the old `[[ -x "$helper" ]]` guard skip it,
+# leaving it unsigned and breaking the final bundle sign with
+# "code object is not signed at all / In subcomponent: …".
+while IFS= read -r -d '' helper; do
+    [[ "$helper" == "$APP_BIN" ]] && continue
     file "$helper" | grep -q 'Mach-O' || continue
-    [[ "$(basename "$helper")" == "$APP_NAME" ]] && continue
+    echo "==> Signing nested component: $(basename "$helper")"
     codesign "${SIGN_ARGS[@]}" "$helper"
-done
+done < <(find "$APP/Contents/MacOS" -type f -print0)
 
-# Sign the bundle itself. Use --deep so codesign recursively signs every
-# nested Mach-O (Frameworks dylibs, Contents/MacOS helpers like MacSoSoMCP,
-# XPC services, plug-ins) with the same identity. This is the canonical fix
-# for "code object is not signed at all / In subcomponent: …" — it makes the
-# bundle signature self-sufficient instead of relying solely on the manual
-# nested-signing loops above, and also applies the hardened runtime to all
-# nested code when using a Developer ID identity.
-codesign "${SIGN_ARGS[@]}" --deep \
+# Sign the bundle container itself. Every nested component (Frameworks dylibs,
+# the Contents/MacOS helper MacSoSoMCP, plus any Helpers/PlugIns/XPCServices
+# discovered above) has already been signed individually, so we sign the bundle
+# WITHOUT --deep. Apple discourages --deep (it re-signs nested code in
+# unpredictable order and is a common source of "code object is not signed at
+# all / In subcomponent" failures on newer macOS), and it is unnecessary here
+# because the loops above already signed each component in the correct order.
+codesign "${SIGN_ARGS[@]}" \
     --entitlements "$ROOT/MacSoSo/MacSoSo.entitlements" \
     "$APP"
 codesign --verify --deep --strict "$APP"
