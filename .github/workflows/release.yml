@@ -285,7 +285,7 @@ jobs:
           Upstream attribution and third-party licenses are included in the
           DMG and in the repository (`NOTICE`, `THIRD_PARTY_NOTICES.md`).
           EOF
-          sed -i "s/__VERSION__/${VERSION}/g; s/__TAG__/${TAG}/g; s/__REPO__/${REPO}/g" RELEASE_NOTES.md
+          sed -i "s|__VERSION__|${VERSION}|g; s|__TAG__|${TAG}|g; s|__REPO__|${REPO}|g" RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
       - name: Publish
