@@ -189,12 +189,24 @@ copy_dependencies() {
     done < <(otool -L "$binary" | awk 'NR > 1 { print $1 }')
 }
 
+# Collect every nested Mach-O executable inside the bundle so that (a) their
+# external dylibs get bundled/rewritten and (b) they are all individually
+# signed before the bundle itself. We scan the standard nested-code locations
+# and also follow symlinks, because Xcode's "Copy Files" phase can land a
+# helper/CLI tool (e.g. MacSoSoMCP) that must be code-signed or the final
+# bundle sign fails with "code object is not signed at all In subcomponent".
 APP_MACHOS=()
 while IFS= read -r -d '' candidate; do
+    # `file` and `codesign` both follow symlinks, so testing the bundle path
+    # directly is sufficient (no need for readlink -f, which is GNU-only).
+    [[ -f "$candidate" ]] || continue
     if file "$candidate" | grep -q 'Mach-O'; then
         APP_MACHOS+=("$candidate")
     fi
-done < <(find "$APP/Contents/MacOS" -type f -print0)
+done < <(find "$APP/Contents" \
+    \( -path '*/MacOS/*' -o -path '*/Helpers/*' -o -path '*/PlugIns/*' \
+       -o -path '*/XPCServices/*' -o -path '*/Library/*' \) \
+    \( -type f -o -type l \) -print0)
 
 for binary in "${APP_MACHOS[@]}"; do
     copy_dependencies "$binary"
@@ -272,6 +284,17 @@ fi
 # then the bundle itself with its entitlements.
 for ((i = ${#APP_MACHOS[@]} - 1; i >= 0; i--)); do
     codesign "${SIGN_ARGS[@]}" "${APP_MACHOS[$i]}"
+done
+
+# Belt-and-suspenders: explicitly sign every non-main executable copied into
+# Contents/MacOS (Xcode's "Copy Files" phase drops helpers like MacSoSoMCP
+# there unsigned). If any nested Mach-O is left unsigned, the bundle sign
+# below fails with "code object is not signed at all In subcomponent".
+for helper in "$APP/Contents/MacOS"/*; do
+    [[ -f "$helper" && -x "$helper" ]] || continue
+    file "$helper" | grep -q 'Mach-O' || continue
+    [[ "$(basename "$helper")" == "$APP_NAME" ]] && continue
+    codesign "${SIGN_ARGS[@]}" "$helper"
 done
 
 codesign "${SIGN_ARGS[@]}" \
